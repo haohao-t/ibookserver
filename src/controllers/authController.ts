@@ -3,11 +3,25 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import pool from '../config/database';
+import { sendEmailVerificationCode, sendPasswordResetCode } from '../services/emailService';
+
+// In-memory store for pending email changes (userId → request)
+interface EmailChangeEntry {
+  newEmail: string;
+  code: string;
+  expiresAt: number;
+}
+const pendingEmailChanges = new Map<number, EmailChangeEntry>();
+
+// In-memory store for password resets (email → request)
+interface PasswordResetEntry {
+  code: string;
+  expiresAt: number;
+}
+const pendingPasswordResets = new Map<string, PasswordResetEntry>();
 
 dotenv.config();
 
-// ============= ПРОСТЕЙШИЙ ЛОГГЕР =============
-// Просто console.log с эмодзи, ничего больше!
 const log = {
   info: (msg: string) => console.log('📝', msg),
   success: (msg: string) => console.log('✅', msg),
@@ -15,23 +29,20 @@ const log = {
   error: (msg: string, err?: any) => console.log('❌', msg, err?.message || ''),
   debug: (msg: string) => console.log('🔍', msg)
 };
-// ============================================
 
-// Проверка JWT_SECRET
 if (!process.env.JWT_SECRET) {
   log.error('JWT_SECRET не задан в .env!');
   process.exit(1);
 }
 
 export const authController = {
-  // РЕГИСТРАЦИЯ
   async register(req: Request, res: Response) {
     try {
       log.info('Регистрация: ' + req.body.email);
       
-      const { email, username, password } = req.body;
+      const { email, username, password, avatar_emoji } = req.body;
+      const finalAvatar = avatar_emoji || '🌿';
 
-      // Простые проверки
       if (!email || !username || !password) {
         log.warn('Не все поля заполнены');
         return res.status(400).json({ error: 'Все поля обязательны' });
@@ -42,7 +53,6 @@ export const authController = {
         return res.status(400).json({ error: 'Пароль должен быть минимум 6 символов' });
       }
 
-      // Проверка существующего пользователя
       const existingUser = await pool.query(
         'SELECT * FROM users WHERE email = $1 OR username = $2',
         [email, username]
@@ -53,19 +63,17 @@ export const authController = {
         return res.status(400).json({ error: 'Email или username уже используется' });
       }
 
-      // Создание пользователя
       const passwordHash = await bcrypt.hash(password, 10);
       
       const newUser = await pool.query(
-        `INSERT INTO users (email, username, password_hash, role, reading_goal_pages) 
-         VALUES ($1, $2, $3, 'reader', 30) 
-         RETURNING id, email, username, role`,
-        [email, username, passwordHash]
+        `INSERT INTO users (email, username, password_hash, role, reading_goal_pages, avatar_emoji) 
+         VALUES ($1, $2, $3, 'reader', 30, $4) 
+         RETURNING id, email, username, role, avatar_emoji`,
+        [email, username, passwordHash, finalAvatar]
       );
 
       const user = newUser.rows[0];
 
-      // Токен
       const token = jwt.sign(
         { id: user.id, email: user.email, username: user.username, role: user.role },
         process.env.JWT_SECRET!,
@@ -77,7 +85,13 @@ export const authController = {
       res.status(201).json({
         message: 'Регистрация успешна',
         token,
-        user
+        user: {
+          id: user.id,
+          email: user.email,
+          username: user.username,
+          role: user.role,
+          avatar_emoji: user.avatar_emoji
+        }
       });
 
     } catch (error: any) {
@@ -86,7 +100,6 @@ export const authController = {
     }
   },
 
-  // ВХОД
   async login(req: Request, res: Response) {
     try {
       log.info('Вход: ' + req.body.nameOrEmail);
@@ -98,7 +111,6 @@ export const authController = {
         return res.status(400).json({ error: 'Все поля обязательны' });
       }
 
-      // Поиск пользователя
       const userResult = await pool.query(
         'SELECT * FROM users WHERE email = $1 OR username = $1',
         [nameOrEmail]
@@ -111,20 +123,12 @@ export const authController = {
 
       const user = userResult.rows[0];
 
-      // Проверка пароля
       const validPassword = await bcrypt.compare(password, user.password_hash);
       if (!validPassword) {
         log.warn('Неверный пароль для: ' + nameOrEmail);
         return res.status(401).json({ error: 'Неверный email или пароль' });
       }
 
-      // Обновляем время входа
-      await pool.query(
-        'UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1',
-        [user.id]
-      );
-
-      // Токен
       const token = jwt.sign(
         { id: user.id, email: user.email, username: user.username, role: user.role },
         process.env.JWT_SECRET!,
@@ -140,7 +144,9 @@ export const authController = {
           id: user.id,
           email: user.email,
           username: user.username,
-          role: user.role
+          role: user.role,
+          avatar_emoji: user.avatar_emoji,
+          reading_goal_pages: user.reading_goal_pages
         }
       });
 
@@ -150,14 +156,14 @@ export const authController = {
     }
   },
 
-  // ПОЛУЧИТЬ ПОЛЬЗОВАТЕЛЯ
   async getMe(req: Request, res: Response) {
     try {
       const userId = (req as any).user.id;
       log.info('Запрос данных пользователя: ' + userId);
 
       const userResult = await pool.query(
-        'SELECT id, email, username, role, reading_goal_pages, created_at, last_login_at FROM users WHERE id = $1',
+        `SELECT id, email, username, role, reading_goal_pages, avatar_emoji, created_at 
+         FROM users WHERE id = $1`,
         [userId]
       );
 
@@ -173,5 +179,265 @@ export const authController = {
       log.error('Ошибка получения пользователя:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
-  }
+  },
+
+  async updateAvatar(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user.id;
+      const { avatar_emoji } = req.body;
+
+      const validAvatars = ['📚', '📖', '🦉', '🐛', '📕', '⭐', '🎓', '🏆', '🌈', '🚀', '🎭', '🗡️', '🤖', '🔍', '💕', '😱', '😂', '🧙', '👩‍🚀', '🐺', '🌸', '🍃', '🌿', '💚', '✨', '🌱', '🍀', '🌙', '☕'];
+
+      if (!validAvatars.includes(avatar_emoji)) {
+        return res.status(400).json({ error: 'Неверный аватар' });
+      }
+
+      await pool.query(
+        'UPDATE users SET avatar_emoji = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [avatar_emoji, userId]
+      );
+
+      res.json({ success: true, avatar_emoji });
+    } catch (error) {
+      console.error('Ошибка обновления аватара:', error);
+      res.status(500).json({ error: 'Ошибка сервера' });
+    }
+  },
+
+  async updateReadingGoal(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user.id;
+      const { reading_goal_pages } = req.body;
+
+      const goal = Number(reading_goal_pages);
+      if (!reading_goal_pages || !Number.isInteger(goal) || goal < 1 || goal > 10000) {
+        return res.status(400).json({ error: 'Цель должна быть числом от 1 до 10000' });
+      }
+
+      await pool.query(
+        'UPDATE users SET reading_goal_pages = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [reading_goal_pages, userId]
+      );
+
+      res.json({ success: true, reading_goal_pages });
+    } catch (error) {
+      console.error('Ошибка обновления цели:', error);
+      res.status(500).json({ error: 'Ошибка сервера' });
+    }
+  },
+
+  async updateUsername(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user.id;
+      const { username } = req.body;
+
+      if (!username || typeof username !== 'string') {
+        return res.status(400).json({ error: 'Имя пользователя обязательно' });
+      }
+
+      const trimmed = username.trim();
+
+      if (trimmed.length < 3) {
+        return res.status(400).json({ error: 'Минимум 3 символа' });
+      }
+      if (trimmed.length > 30) {
+        return res.status(400).json({ error: 'Максимум 30 символов' });
+      }
+      if (!/^[a-zA-Zа-яёА-ЯЁ0-9_]+$/.test(trimmed)) {
+        return res.status(400).json({ error: 'Только буквы, цифры и символ _' });
+      }
+
+      const existing = await pool.query(
+        'SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id != $2',
+        [trimmed, userId]
+      );
+      if (existing.rows.length > 0) {
+        return res.status(400).json({ error: 'Это имя уже занято' });
+      }
+
+      await pool.query(
+        'UPDATE users SET username = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [trimmed, userId]
+      );
+
+      log.success(`Имя обновлено: ${trimmed}`);
+      res.json({ success: true, username: trimmed });
+    } catch (error) {
+      console.error('Ошибка обновления имени:', error);
+      res.status(500).json({ error: 'Ошибка сервера' });
+    }
+  },
+
+  async requestEmailChange(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user.id;
+      const { newEmail } = req.body;
+
+      if (!newEmail || typeof newEmail !== 'string') {
+        return res.status(400).json({ error: 'Email обязателен' });
+      }
+
+      const email = newEmail.trim().toLowerCase();
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+      if (!emailRegex.test(email)) {
+        return res.status(400).json({ error: 'Некорректный email' });
+      }
+
+      const currentUser = await pool.query(
+        'SELECT email, username FROM users WHERE id = $1',
+        [userId]
+      );
+      if (!currentUser.rows.length) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+      }
+
+      if (currentUser.rows[0].email.toLowerCase() === email) {
+        return res.status(400).json({ error: 'Это уже ваш текущий email' });
+      }
+
+      const taken = await pool.query(
+        'SELECT id FROM users WHERE LOWER(email) = $1',
+        [email]
+      );
+      if (taken.rows.length > 0) {
+        return res.status(400).json({ error: 'Этот email уже используется' });
+      }
+
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+      pendingEmailChanges.set(userId, {
+        newEmail: email,
+        code,
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      });
+
+      await sendEmailVerificationCode(email, code, currentUser.rows[0].username);
+
+      log.success(`Код смены email отправлен для userId=${userId}`);
+      res.json({ success: true, message: 'Код отправлен на новый email' });
+    } catch (error) {
+      console.error('Ошибка запроса смены email:', error);
+      res.status(500).json({ error: 'Не удалось отправить код. Проверьте email' });
+    }
+  },
+
+  async confirmEmailChange(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user.id;
+      const { code } = req.body;
+
+      if (!code || typeof code !== 'string') {
+        return res.status(400).json({ error: 'Код обязателен' });
+      }
+
+      const entry = pendingEmailChanges.get(userId);
+      if (!entry) {
+        return res.status(400).json({ error: 'Запрос не найден. Запросите код заново' });
+      }
+
+      if (Date.now() > entry.expiresAt) {
+        pendingEmailChanges.delete(userId);
+        return res.status(400).json({ error: 'Код истёк. Запросите новый' });
+      }
+
+      if (entry.code !== code.trim()) {
+        return res.status(400).json({ error: 'Неверный код' });
+      }
+
+      await pool.query(
+        'UPDATE users SET email = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [entry.newEmail, userId]
+      );
+
+      pendingEmailChanges.delete(userId);
+
+      log.success(`Email обновлён для userId=${userId}: ${entry.newEmail}`);
+      res.json({ success: true, email: entry.newEmail });
+    } catch (error) {
+      console.error('Ошибка подтверждения email:', error);
+      res.status(500).json({ error: 'Ошибка сервера' });
+    }
+  },
+
+  async forgotPassword(req: Request, res: Response) {
+    try {
+      const { email } = req.body;
+
+      if (!email || typeof email !== 'string') {
+        return res.status(400).json({ error: 'Email обязателен' });
+      }
+
+      const trimmedEmail = email.trim().toLowerCase();
+
+      const userResult = await pool.query(
+        'SELECT id, username FROM users WHERE LOWER(email) = $1',
+        [trimmedEmail]
+      );
+
+      // Always return success to not leak whether email exists
+      if (userResult.rows.length === 0) {
+        return res.json({ success: true, message: 'Если email зарегистрирован, код будет отправлен' });
+      }
+
+      const user = userResult.rows[0];
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+      pendingPasswordResets.set(trimmedEmail, {
+        code,
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      });
+
+      await sendPasswordResetCode(trimmedEmail, code, user.username);
+
+      log.success(`Код сброса пароля отправлен для ${trimmedEmail}`);
+      res.json({ success: true, message: 'Если email зарегистрирован, код будет отправлен' });
+    } catch (error) {
+      console.error('Ошибка forgot password:', error);
+      res.status(500).json({ error: 'Ошибка сервера' });
+    }
+  },
+
+  async resetPassword(req: Request, res: Response) {
+    try {
+      const { email, code, newPassword } = req.body;
+
+      if (!email || !code || !newPassword) {
+        return res.status(400).json({ error: 'Все поля обязательны' });
+      }
+
+      if (newPassword.length < 6) {
+        return res.status(400).json({ error: 'Пароль должен быть минимум 6 символов' });
+      }
+
+      const trimmedEmail = email.trim().toLowerCase();
+      const entry = pendingPasswordResets.get(trimmedEmail);
+
+      if (!entry) {
+        return res.status(400).json({ error: 'Запрос не найден. Запросите код заново' });
+      }
+
+      if (Date.now() > entry.expiresAt) {
+        pendingPasswordResets.delete(trimmedEmail);
+        return res.status(400).json({ error: 'Код истёк. Запросите новый' });
+      }
+
+      if (entry.code !== code.trim()) {
+        return res.status(400).json({ error: 'Неверный код' });
+      }
+
+      const passwordHash = await bcrypt.hash(newPassword, 10);
+      await pool.query(
+        'UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = $2',
+        [passwordHash, trimmedEmail]
+      );
+
+      pendingPasswordResets.delete(trimmedEmail);
+
+      log.success(`Пароль сброшен для ${trimmedEmail}`);
+      res.json({ success: true, message: 'Пароль успешно изменён' });
+    } catch (error) {
+      console.error('Ошибка reset password:', error);
+      res.status(500).json({ error: 'Ошибка сервера' });
+    }
+  },
 };

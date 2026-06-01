@@ -1,19 +1,37 @@
 import { Pool } from 'pg';
+import dotenv from 'dotenv';
+import path from 'path';
 
-// ЖЁСТКО прописываем параметры подключения
-const pool = new Pool({
-  host: 'localhost',
-  port: 5432,
-  database: 'person_liprary',
-  user: 'postgres',
-  password: 'asasd',  // Пароль прямо здесь!
-  // Эти настройки важны для Windows
-  connectionTimeoutMillis: 5000,
-  idleTimeoutMillis: 30000,
-  max: 10
-});
+// Загружаем .env прямо здесь — database.ts инициализируется раньше dotenv.config() в index.ts
+dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
-// Тест подключения с явным запросом
+const isCloud = !!process.env.DATABASE_URL;
+
+const pool = new Pool(
+  isCloud
+    ? {
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+        connectionTimeoutMillis: 15000,
+        idleTimeoutMillis: 60000,
+        max: 10,
+      }
+    : {
+        host: process.env.DB_HOST || 'localhost',
+        port: parseInt(process.env.DB_PORT || '5432'),
+        database: process.env.DB_NAME || 'ibook_db',
+        user: process.env.DB_USER || 'postgres',
+        password: process.env.DB_PASSWORD || 'asasd',
+        ssl: false,
+        connectionTimeoutMillis: 15000,
+        idleTimeoutMillis: 30000,
+        max: 10,
+        allowExitOnIdle: false,
+        keepAlive: true,
+        keepAliveInitialDelayMillis: 10000,
+      }
+);
+
 pool.query('SELECT 1 + 1 AS result', (err, res) => {
   if (err) {
     console.error('\n❌ ОШИБКА ПОДКЛЮЧЕНИЯ К БД:');

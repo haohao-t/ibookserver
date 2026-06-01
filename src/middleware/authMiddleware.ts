@@ -1,10 +1,8 @@
-// book_server/src/middleware/authMiddleware.ts
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 
 export const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Получаем заголовок Authorization
     const authHeader = req.headers.authorization;
     
     if (!authHeader) {
@@ -12,7 +10,6 @@ export const authMiddleware = (req: Request, res: Response, next: NextFunction) 
       return res.status(401).json({ error: 'Требуется авторизация' });
     }
 
-    // Формат: "Bearer TOKEN"
     const token = authHeader.split(' ')[1];
     
     if (!token) {
@@ -20,7 +17,6 @@ export const authMiddleware = (req: Request, res: Response, next: NextFunction) 
       return res.status(401).json({ error: 'Неверный формат токена' });
     }
 
-    // Проверяем токен
     const decoded = jwt.verify(token, process.env.JWT_SECRET!) as {
       id: number;
       email: string;
@@ -30,7 +26,6 @@ export const authMiddleware = (req: Request, res: Response, next: NextFunction) 
 
     console.log('[Auth] ✅ Пользователь из токена:', decoded.id);
     
-    // Добавляем пользователя в запрос
     (req as any).user = decoded;
     
     next();
