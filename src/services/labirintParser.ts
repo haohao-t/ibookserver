@@ -1,5 +1,3 @@
-// book_server/src/services/labirintParser.ts
-
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 
@@ -13,7 +11,9 @@ export interface BookData {
     language: string;
     isbn: string;
     publish_year: number | null;
-    genre?: string;
+    genres?: string[] | undefined;
+    series?: string | undefined;
+    sourceUrl?: string | undefined;
   }
 
 class LabirintParser {
@@ -31,8 +31,8 @@ class LabirintParser {
   }
 
   async searchByISBN(isbn: string): Promise<BookData | null> {
-    console.log('\n📖 [Лабиринт] ========== НАЧАЛО ПАРСИНГА ==========');
-    console.log('📖 [Лабиринт] ISBN:', isbn);
+    console.log('\n[Лабиринт] ========== НАЧАЛО ПАРСИНГА ==========');
+    console.log('[Лабиринт] ISBN:', isbn);
 
     await this.rateLimit();
 
@@ -43,11 +43,11 @@ class LabirintParser {
       bookData = await this.searchViaSearchPage(isbn);
       if (bookData) return bookData;
 
-      console.log('📖 [Лабиринт] ❌ Книга не найдена');
+      console.log('[Лабиринт] Книга не найдена');
       return null;
 
     } catch (error) {
-      console.error('📖 [Лабиринт] ❌ Ошибка парсинга:', error);
+      console.error('[Лабиринт] Ошибка парсинга:', error);
       return null;
     }
   }
@@ -56,7 +56,7 @@ class LabirintParser {
     try {
       const cleanIsbn = isbn.replace(/[-\s]/g, '');
       const directUrl = `https://www.labirint.ru/books/${cleanIsbn}/`;
-      console.log('📖 [Лабиринт] Пробуем прямой URL:', directUrl);
+      console.log('[Лабиринт] Пробуем прямой URL:', directUrl);
 
       const response = await axios.get(directUrl, {
         headers: { 'User-Agent': this.USER_AGENT },
@@ -64,12 +64,12 @@ class LabirintParser {
         validateStatus: (status) => status === 200
       });
 
-      console.log('📖 [Лабиринт] ✅ Прямой URL сработал!');
+      console.log('[Лабиринт] Прямой URL сработал!');
       await this.rateLimit();
       return await this.parseBookPage(directUrl, isbn);
 
     } catch (error) {
-      console.log('📖 [Лабиринт] Прямой URL не доступен');
+      console.log('[Лабиринт] Прямой URL не доступен');
       return null;
     }
   }
@@ -77,7 +77,7 @@ class LabirintParser {
   private async searchViaSearchPage(isbn: string): Promise<BookData | null> {
     try {
       const searchUrl = `https://www.labirint.ru/search/${isbn}/`;
-      console.log('📖 [Лабиринт] URL поиска:', searchUrl);
+      console.log('[Лабиринт] URL поиска:', searchUrl);
 
       const response = await axios.get(searchUrl, {
         headers: {
@@ -94,7 +94,6 @@ class LabirintParser {
 
       const $ = cheerio.load(response.data);
 
-      // Ищем ссылки на книги разными способами
       let bookLinks = $('.product a.product-title-link').toArray();
       
       if (bookLinks.length === 0) {
@@ -102,7 +101,7 @@ class LabirintParser {
       }
 
       if (bookLinks.length === 0) {
-        console.log('📖 [Лабиринт] ❌ Книги не найдены в поиске');
+        console.log('[Лабиринт] Книги не найдены в поиске');
         return null;
       }
 
@@ -113,20 +112,17 @@ class LabirintParser {
         ? firstBookLink
         : `https://www.labirint.ru${firstBookLink}`;
 
-      console.log('📖 [Лабиринт] URL книги:', bookUrl);
+      console.log('[Лабиринт] URL книги:', bookUrl);
       await this.rateLimit();
 
       return await this.parseBookPage(bookUrl, isbn);
 
     } catch (error) {
-      console.error('📖 [Лабиринт] Ошибка поиска:', error);
+      console.error('[Лабиринт] Ошибка поиска:', error);
       return null;
     }
   }
 
-  /**
-   * Парсинг страницы книги
-   */
   private async parseBookPage(bookUrl: string, isbn: string): Promise<BookData | null> {
     try {
       const response = await axios.get(bookUrl, {
@@ -139,8 +135,7 @@ class LabirintParser {
       }
 
       const $ = cheerio.load(response.data);
-
-      // ИЗВЛЕКАЕМ ДАННЫЕ
+ 
       let title = this.extractTitle($);
       let authors = this.extractAuthors($);
       const publisher = this.extractPublisher($);
@@ -148,28 +143,25 @@ class LabirintParser {
       const year = this.extractYear($);
       const coverUrl = this.extractCoverUrl($);
       const description = this.extractDescription($);
-
-      // ВАЖНО: Если авторы не найдены, проверяем название
+ 
       if (authors.length === 0 && title && title.includes(':')) {
-        console.log('📖 [Лабиринт] Автор не найден отдельно, проверяем название...');
-        
-        // Разделяем название по двоеточию
+        console.log('[Лабиринт] Автор не найден отдельно, проверяем название...');
+         
         const parts = title.split(':');
         const possibleTitle = (parts[0] ?? '').trim();
-        const possibleAuthor = parts.slice(1).join(':').trim(); // На случай если есть несколько двоеточий
+        const possibleAuthor = parts.slice(1).join(':').trim();
         
-        console.log('📖 [Лабиринт] Возможное название:', possibleTitle);
-        console.log('📖 [Лабиринт] Возможный автор:', possibleAuthor);
+        console.log('[Лабиринт] Возможное название:', possibleTitle);
+        console.log('[Лабиринт] Возможный автор:', possibleAuthor);
         
-        // Проверяем, похоже ли на автора (содержит буквы, не слишком длинное)
         if (possibleAuthor.length > 0 && possibleAuthor.length < 100) {
           title = possibleTitle;
           authors = [possibleAuthor];
-          console.log('📖 [Лабиринт] ✅ Разделили название и автора');
+          console.log('[Лабиринт] Разделили название и автора');
         }
       }
 
-      console.log('📖 [Лабиринт] ✅ Книга найдена:');
+      console.log('[Лабиринт] Книга найдена:');
       console.log('   Название:', title);
       console.log('   Авторы:', authors);
       console.log('   Издательство:', publisher);
@@ -188,28 +180,22 @@ class LabirintParser {
       };
 
     } catch (error) {
-      console.error('📖 [Лабиринт] Ошибка парсинга страницы:', error);
+      console.error('[Лабиринт] Ошибка парсинга страницы:', error);
       return null;
     }
   }
 
-  /**
-   * Извлекает название книги
-   */
   private extractTitle($: any): string {
-    // Пробуем найти заголовок h1
     const titleElement = $('h1.product-title');
     if (titleElement.length > 0) {
       return titleElement.text().trim() || '';
     }
     
-    // Альтернативный заголовок
     const altTitle = $('h1[itemprop="name"]');
     if (altTitle.length > 0) {
       return altTitle.text().trim() || '';
     }
     
-    // Берем из meta-тегов
     const metaTitle = $('meta[property="og:title"]').attr('content');
     if (metaTitle) {
       return metaTitle || '';
@@ -218,13 +204,9 @@ class LabirintParser {
     return '';
   }
 
-  /**
-   * Извлекает авторов книги
-   */
   private extractAuthors($: any): string[] {
     const authors: string[] = [];
     
-    // 1️⃣ Ищем по специальной ссылке (самый надежный способ)
     const authorElements = $('a[data-event-label="author"]');
     authorElements.each((i: number, el: any) => {
       const author = $(el).text().trim();
@@ -233,13 +215,11 @@ class LabirintParser {
       }
     });
 
-    // 2️⃣ Если не нашли, ищем в product-meta
     if (authors.length === 0) {
       const prodMeta = $('.product-meta');
       if (prodMeta.length > 0) {
         const text = prodMeta.text();
         
-        // Ищем паттерн "Автор: Имя Фамилия"
         const authorMatch = text.match(/Автор[:\s]+([^\n]+)/i);
         if (authorMatch && authorMatch[1]) {
           const authorList = authorMatch[1].split(/[,;]/).map((a: string) => a.trim());
@@ -248,7 +228,6 @@ class LabirintParser {
       }
     }
 
-    // 3️⃣ Ищем в деталях товара
     if (authors.length === 0) {
       const details = $('.product-description').text();
       const detailsMatch = details.match(/Автор[:\s]+([^\n]+)/i);
@@ -260,9 +239,6 @@ class LabirintParser {
     return authors;
   }
 
-  /**
-   * Извлекает издательство
-   */
   private extractPublisher($: any): string {
     const publisherElement = $('a[data-event-label="publisher"]');
     if (publisherElement.length > 0) {
@@ -278,9 +254,6 @@ class LabirintParser {
     return '';
   }
 
-  /**
-   * Извлекает количество страниц
-   */
   private extractPages($: any): number | null {
     const pagesElement = $('meta[itemprop="numberOfPages"]');
     if (pagesElement.length > 0) {
@@ -298,9 +271,6 @@ class LabirintParser {
     return null;
   }
 
-  /**
-   * Извлекает год издания
-   */
   private extractYear($: any): number | null {
     const text = $('.product-meta').text();
     const match = text.match(/(19|20)\d{2}\s*г\./);
@@ -319,16 +289,9 @@ class LabirintParser {
     return null;
   }
 
- /**
- * Извлекает URL обложки
- */
-/**
- * Извлекает URL обложки
- */
 private extractCoverUrl($: any): string {
   let coverUrl = '';
   
-  // 1️⃣ Пробуем найти изображение обложки
   const imgSelectors = [
     'img.cover-image',
     'img.book-cover',
@@ -341,12 +304,10 @@ private extractCoverUrl($: any): string {
   for (const selector of imgSelectors) {
     const imgElement = $(selector);
     if (imgElement.length > 0) {
-      // Пробуем разные атрибуты с изображением
       const src = imgElement.attr('src');
       const dataSrc = imgElement.attr('data-src');
       const dataOriginal = imgElement.attr('data-original');
       
-      // Берем первый непустой атрибут
       if (src && typeof src === 'string' && src.trim() !== '') {
         coverUrl = src.trim();
         break;
@@ -362,7 +323,6 @@ private extractCoverUrl($: any): string {
     }
   }
 
-  // 2️⃣ Если не нашли, пробуем meta og:image
   if (!coverUrl) {
     const ogImage = $('meta[property="og:image"]').attr('content');
     if (ogImage && typeof ogImage === 'string' && ogImage.trim() !== '') {
@@ -370,36 +330,29 @@ private extractCoverUrl($: any): string {
     }
   }
 
-  // 3️⃣ Нормализуем URL (только если coverUrl не пустой)
   if (coverUrl && coverUrl.trim() !== '') {
     coverUrl = coverUrl.trim();
     
-    // Если URL начинается с // (протоколонезависимый), добавляем https:
     if (coverUrl.startsWith('//')) {
       coverUrl = 'https:' + coverUrl;
     }
     
-    // Если URL относительный, добавляем домен Лабиринта
     if (coverUrl.startsWith('/')) {
       coverUrl = 'https://www.labirint.ru' + coverUrl;
     }
     
-    // Убеждаемся, что URL начинается с http
     if (!coverUrl.startsWith('http')) {
       coverUrl = 'https://' + coverUrl;
     }
     
-    console.log('📖 [Лабиринт] Обложка найдена:', coverUrl);
+    console.log('[Лабиринт] Обложка найдена:', coverUrl);
     return coverUrl;
   }
 
-  console.log('📖 [Лабиринт] Обложка не найдена');
+  console.log('[Лабиринт] Обложка не найдена');
   return '';
 }
 
-  /**
-   * Извлекает описание книги
-   */
   private extractDescription($: any): string {
     const description = $('.product-description');
     if (description.length > 0) {

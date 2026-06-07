@@ -12,7 +12,9 @@ export interface BookData {
   isbn: string;
   publish_year: number | null;
   series?: string | undefined;
+  genres?: string[] | undefined;
   sourceUrl?: string | undefined;
+  rating?: number | null;
 }
 
 class LiveLibParser {
@@ -41,15 +43,14 @@ class LiveLibParser {
   }
 
   async searchByISBN(isbn: string): Promise<BookData | null> {
-    console.log('\n📗 [LiveLib] ========== НАЧАЛО ПАРСИНГА ==========');
-    console.log('📗 [LiveLib] ISBN:', isbn);
+    console.log('\n[LiveLib] ========== НАЧАЛО ПАРСИНГА ==========');
+    console.log('[LiveLib] ISBN:', isbn);
 
     await this.rateLimit();
 
     try {
-      // Шаг 1: страница поиска по ISBN
       const searchUrl = `https://www.livelib.ru/find/books/${isbn}`;
-      console.log('📗 [LiveLib] Поиск:', searchUrl);
+      console.log('[LiveLib] Поиск:', searchUrl);
 
       const searchResp = await axios.get(searchUrl, {
         headers: this.headers,
@@ -58,33 +59,29 @@ class LiveLibParser {
         validateStatus: s => s < 500,
       });
 
-      console.log('📗 [LiveLib] Статус поиска:', searchResp.status);
+      console.log('[LiveLib] Статус поиска:', searchResp.status);
       if (searchResp.status !== 200) {
-        console.log('📗 [LiveLib] ❌ Поиск вернул не 200');
+        console.log('[LiveLib] Поиск вернул не 200');
         return null;
       }
 
-      // Проверяем финальный URL после редиректов
       const finalSearchUrl: string = searchResp.request?.res?.responseUrl ?? searchUrl;
-      console.log('📗 [LiveLib] Финальный URL после редиректа:', finalSearchUrl);
+      console.log('[LiveLib] Финальный URL после редиректа:', finalSearchUrl);
 
-      // Шаг 2а: Если LiveLib сразу редиректнул на страницу книги — парсим напрямую
       if (finalSearchUrl.includes('/book/') && !finalSearchUrl.includes('/find/')) {
-        console.log('📗 [LiveLib] Редирект на страницу книги — парсим напрямую');
+        console.log('[LiveLib] Редирект на страницу книги — парсим напрямую');
         return this.parsePage(searchResp.data, isbn, finalSearchUrl);
       }
 
-      // Шаг 2б: Страница поиска — извлекаем ссылку на первую книгу
       const bookUrl = this.extractFirstBookUrl(searchResp.data);
       if (!bookUrl) {
-        console.log('📗 [LiveLib] ❌ Книги не найдены в результатах поиска');
+        console.log('[LiveLib] Книги не найдены в результатах поиска');
         return null;
       }
 
-      console.log('📗 [LiveLib] Страница книги:', bookUrl);
+      console.log('[LiveLib] Страница книги:', bookUrl);
       await this.rateLimit();
 
-      // Шаг 3: парсим страницу книги
       const bookResp = await axios.get(bookUrl, {
         headers: this.headers,
         timeout: 10000,
@@ -97,7 +94,7 @@ class LiveLibParser {
       return this.parsePage(bookResp.data, isbn, finalUrl);
 
     } catch (error: any) {
-      console.error('📗 [LiveLib] ❌ Ошибка:', error.message);
+      console.error('[LiveLib] Ошибка:', error.message);
       return null;
     }
   }
@@ -105,7 +102,6 @@ class LiveLibParser {
   private extractFirstBookUrl(html: string): string | null {
     const $ = cheerio.load(html);
 
-    // Приоритет — специфичные контейнеры поисковой выдачи LiveLib
     const mainResultSelectors = [
       '#objects-by-rating .brow-book-name a',
       '.objects-by-rating .brow-book-name a',
@@ -120,18 +116,15 @@ class LiveLibParser {
       const el = $(sel).first();
       const href = el.attr('href');
       if (href && href.includes('/book/') && !href.includes('/review') && !href.includes('/tag')) {
-        console.log(`📗 [LiveLib] URL найден через селектор "${sel}":`, href);
+        console.log(`[LiveLib] URL найден через селектор "${sel}":`, href);
         return href.startsWith('http') ? href : `https://www.livelib.ru${href}`;
       }
     }
 
-    // Запасной вариант: ищем ссылку вида /book/ЦИФРЫ- (страница книги по ID)
-    // Это надёжнее, чем брать любую /book/ ссылку, — боковые панели дают другие форматы
     let found: string | null = null;
     $('a[href*="/book/"]').each((_: any, el: any) => {
       if (found) return false as any;
       const href = $(el).attr('href') ?? '';
-      // Формат страницы книги: /book/1003861-nazvanie или /book/nazvanie
       if (
         /\/book\/[\w][\w-]*$/.test(href) &&
         !href.includes('/review') &&
@@ -141,12 +134,12 @@ class LiveLibParser {
         !href.includes('/series')
       ) {
         found = href.startsWith('http') ? href : `https://www.livelib.ru${href}`;
-        console.log('📗 [LiveLib] URL найден через fallback-паттерн:', found);
+        console.log('[LiveLib] URL найден через fallback-паттерн:', found);
       }
     });
 
     if (!found) {
-      console.log('📗 [LiveLib] Ни один селектор не дал результата');
+      console.log('[LiveLib] Ни один селектор не дал результата');
     }
     return found;
   }
@@ -156,7 +149,7 @@ class LiveLibParser {
 
     const title = this.extractTitle($);
     if (!title) {
-      console.log('📗 [LiveLib] ❌ Название не найдено');
+      console.log('[LiveLib] Название не найдено');
       return null;
     }
 
@@ -168,11 +161,15 @@ class LiveLibParser {
     const publisher = this.extractPublisher($);
     const series   = this.extractSeries($);
     const lang     = this.extractLanguage($);
+    const genres   = this.extractGenres($);
+    const rating   = this.extractRating($);
 
-    console.log('📗 [LiveLib] ✅ Найдено:', title, '|', authors.join(', '));
-    console.log('📗 [LiveLib] Обложка:', cover ? cover.slice(0, 60) + '...' : '❌ нет');
-    console.log('📗 [LiveLib] Описание:', desc ? desc.slice(0, 80) + '...' : '❌ нет');
-    if (series) console.log('📗 [LiveLib] Серия:', series);
+    console.log('[LiveLib] Найдено:', title, '|', authors.join(', '));
+    console.log('[LiveLib] Обложка:', cover ? cover.slice(0, 60) + '...' : 'нет');
+    console.log('[LiveLib] Описание:', desc ? desc.slice(0, 80) + '...' : 'нет');
+    console.log('[LiveLib] Рейтинг:', rating ?? 'нет');
+    if (series) console.log('[LiveLib] Серия:', series);
+    if (genres.length) console.log('[LiveLib] Жанры:', genres.join(', '));
 
     return {
       title,
@@ -185,14 +182,13 @@ class LiveLibParser {
       isbn,
       publish_year: year,
       series: series || undefined,
+      genres: genres.length ? genres : undefined,
       sourceUrl: pageUrl,
+      rating: rating ?? null,
     };
   }
 
-  // ─── Extractors ───────────────────────────────────────────────────────────
-
   private extractTitle($: cheerio.CheerioAPI): string {
-    // h1 — самый точный, без лишних слов
     const h1Selectors = [
       'h1.bc-header__title',
       'h1[itemprop="name"]',
@@ -204,17 +200,13 @@ class LiveLibParser {
       if (t && t.length > 1) return t;
     }
 
-    // og:title — часто «Книга «Название» — Автор» или «Название — Автор — LiveLib»
     const ogTitle = ($('meta[property="og:title"]').attr('content') ?? '').trim();
     if (ogTitle) {
-      // Извлекаем текст из кавычек «...»
       const quoted = ogTitle.match(/«([^»]+)»/);
       if (quoted?.[1]) return quoted[1].trim();
-      // Убираем «Книга » в начале и всё после первого « — »
       return (ogTitle.replace(/^Книга\s+/i, '').split('—')[0] ?? '').trim();
     }
 
-    // HTML <title> — «Книга «Название» — Автор — LiveLib.ru»
     const htmlTitle = $('title').text().trim();
     if (htmlTitle) {
       const quoted = htmlTitle.match(/«([^»]+)»/);
@@ -228,21 +220,18 @@ class LiveLibParser {
   private extractAuthors($: cheerio.CheerioAPI): string[] {
     const authors: string[] = [];
 
-    // 1️⃣ itemprop="author" + вложенный itemprop="name" — самый точный
     $('[itemprop="author"] [itemprop="name"]').each((_: any, el: any) => {
       const name = $(el).text().trim();
       if (name && name.length > 1 && name.length < 100 && !authors.includes(name)) authors.push(name);
     });
     if (authors.length) return authors;
 
-    // 2️⃣ itemprop="author" напрямую (без вложенности)
     $('[itemprop="author"]').each((_: any, el: any) => {
       const name = $(el).text().trim();
       if (name && name.length > 1 && name.length < 100 && !authors.includes(name)) authors.push(name);
     });
     if (authors.length) return authors;
 
-    // 3️⃣ Ссылки на авторов только в шапке книги (не по всей странице)
     const headerAuthorSelectors = [
       '.bc-header__author a[href*="/author/"]',
       '.work-authors a[href*="/author/"]',
@@ -258,8 +247,6 @@ class LiveLibParser {
       if (authors.length) return authors;
     }
 
-    // 4️⃣ Последний шанс: первая ссылка /author/ в пределах первых 50 ссылок на странице
-    // (не перебираем всю страницу, чтобы не захватить рекомендации)
     let checked = 0;
     $('a[href*="/author/"]').each((_: any, el: any) => {
       if (checked++ > 50 || authors.length) return false;
@@ -281,7 +268,6 @@ class LiveLibParser {
       return '';
     };
 
-    // 1️⃣ Мета-теги OG / Twitter — самый надёжный источник полного URL
     const metaCandidates = [
       $('meta[property="og:image"]').attr('content'),
       $('meta[property="og:image:secure_url"]').attr('content'),
@@ -293,7 +279,6 @@ class LiveLibParser {
       if (normalized) return normalized;
     }
 
-    // 2️⃣ Прямые img-теги (src / data-src / data-original)
     const imgSelectors = [
       'img.bc-cover__img',
       'img[itemprop="image"]',
@@ -309,7 +294,6 @@ class LiveLibParser {
       if (normalized) return normalized;
     }
 
-    // 3️⃣ Любая картинка с CDN LiveLib (boocover / s1.livelib.ru)
     let cdnUrl = '';
     $('img').each((_: any, el: any) => {
       if (cdnUrl) return false as any;
@@ -321,21 +305,26 @@ class LiveLibParser {
     return cdnUrl;
   }
 
-  /** Шаблонные тексты LiveLib — не являются описанием книги */
+  private stripJunk(text: string): string {
+    return text
+      .replace(/\s*(купить|скачать)\s*(книгу|на|в).*$/is, '')
+      .replace(/\s*читайте\s*(отзывы|рецензии|онлайн).*$/is, '')
+      .replace(/\s*на\s+livelib\.ru.*$/is, '')
+      .replace(/\s*livelib\.ru.*$/is, '')
+      .replace(/\s*предлагаем вашему вниманию.*$/is, '')
+      .replace(/\s*рецензии\s*и\s*цитаты.*$/is, '')
+      .replace(/\s*отзывы\s*и\s*рецензии.*$/is, '')
+      .trim();
+  }
+
   private isJunkText(text: string): boolean {
-    return /предлагаем вашему вниманию|читайте отзывы|рецензии.*цитаты|цитаты.*рецензии|купить книгу|скачать книгу|livelib\.ru/i.test(text);
+    const stripped = this.stripJunk(text);
+    return stripped.length < 40;
   }
 
   private extractDescription($: cheerio.CheerioAPI): string {
-    const candidates: string[] = [];
-
-    // og:description — обычно содержит реальное описание (в отличие от meta[name="description"])
-    const ogDesc = ($('meta[property="og:description"]').attr('content') ?? '').trim();
-    if (ogDesc && ogDesc.length > 30 && !this.isJunkText(ogDesc)) {
-      candidates.push(ogDesc);
-    }
-
     const selectors = [
+      '.bc-about__txt',
       '[itemprop="description"]',
       '.bc-annotation__text',
       '#annotation .bc-annotation__text',
@@ -348,36 +337,98 @@ class LiveLibParser {
     ];
 
     for (const sel of selectors) {
-      const t = $(sel).first().text().trim();
-      // Минимум 30 символов, не шаблонный текст
-      if (t && t.length > 30 && !this.isJunkText(t)) {
-        candidates.push(t);
-      }
+      const t = this.stripJunk($(sel).first().text().trim());
+      if (t.length > 40) return t;
     }
 
-    // Берём самое длинное из подходящих
-    if (candidates.length > 0) {
-      return candidates.reduce((a, b) => (a.length >= b.length ? a : b));
-    }
+    const ogDesc = this.stripJunk(($('meta[property="og:description"]').attr('content') ?? '').trim());
+    if (ogDesc.length > 40) return ogDesc;
 
-    // meta description — только если не содержит шаблонный мусор
-    const meta = ($('meta[name="description"]').attr('content') ?? '').trim();
-    if (meta && !this.isJunkText(meta)) {
-      return meta;
-    }
+    const meta = this.stripJunk(($('meta[name="description"]').attr('content') ?? '').trim());
+    if (meta.length > 40) return meta;
 
     return '';
   }
 
   private extractPages($: cheerio.CheerioAPI): number | null {
-    const meta = $('[itemprop="numberOfPages"]').attr('content');
-    if (meta) { const n = parseInt(meta, 10); if (!isNaN(n)) return n; }
+    const metaEl = $('[itemprop="numberOfPages"]');
+    const metaContent = metaEl.attr('content') ?? metaEl.text().trim();
+    if (metaContent) { const n = parseInt(metaContent, 10); if (!isNaN(n) && n > 0) return n; }
+
+    const editionSelectors = [
+      '.bc-edition',
+      '.edition-info',
+      '.book-edition',
+      '.bc-book-edition',
+      '.edition-details',
+      '[data-type="edition"]',
+    ];
+    for (const sel of editionSelectors) {
+      const block = $(sel);
+      if (!block.length) continue;
+      const blockText = block.text();
+      const m = blockText.match(/(\d{2,4})\s*стр/i);
+      if (m?.[1]) { const n = parseInt(m[1], 10); if (!isNaN(n) && n > 0) return n; }
+      const m2 = blockText.match(/страниц[ы]?\s*[:\s]+(\d{2,4})/i);
+      if (m2?.[1]) { const n = parseInt(m2[1], 10); if (!isNaN(n) && n > 0) return n; }
+    }
 
     const text = $('body').text();
-    const m = text.match(/(\d{2,4})\s*стр/);
-    if (m && m[1]) { const n = parseInt(m[1], 10); if (!isNaN(n) && n > 0) return n; }
+    const m = text.match(/страниц[ы]?\s*[:\s]+(\d{2,4})/i) ?? text.match(/(\d{2,4})\s*стр\b/i);
+    if (m?.[1]) { const n = parseInt(m[1], 10); if (!isNaN(n) && n > 0) return n; }
 
     return null;
+  }
+
+  private extractGenres($: cheerio.CheerioAPI): string[] {
+    const genres: string[] = [];
+    const seen = new Set<string>();
+
+    const add = (name: string) => {
+      const clean = name.trim();
+      if (clean && clean.length > 1 && clean.length < 80 && !seen.has(clean)) {
+        seen.add(clean);
+        genres.push(clean);
+      }
+    };
+
+    const genreSelectors = [
+      '.bc-genre a',
+      '.bc-genres a',
+      '.genres a',
+      '.genre-list a',
+      'a[href*="/genre/"]',
+      'a[href*="/tag/"]',
+      '.bc-tags a',
+      '.tags a',
+    ];
+
+    for (const sel of genreSelectors) {
+      $(sel).each((_: any, el: any) => {
+        const href = $(el).attr('href') ?? '';
+        if (href.includes('/genre/') || href.includes('/tag/')) {
+          add($(el).text());
+        }
+      });
+      if (genres.length) break;
+    }
+
+    if (!genres.length) {
+      $('*').each((_: any, el: any) => {
+        const text = $(el).text().trim();
+        if (text === 'Жанры' || text === 'Жанр') {
+          $(el).nextAll().first().find('a').each((_2: any, link: any) => {
+            add($(link).text());
+          });
+          $(el).parent().find('a').each((_2: any, link: any) => {
+            const href = $(link).attr('href') ?? '';
+            if (href.includes('/genre/') || href.includes('/tag/')) add($(link).text());
+          });
+        }
+      });
+    }
+
+    return genres;
   }
 
   private extractYear($: cheerio.CheerioAPI): number | null {
@@ -432,6 +483,37 @@ class LiveLibParser {
     if (m && m[1]) return m[1].trim();
 
     return '';
+  }
+
+  private extractRating($: cheerio.CheerioAPI): number | null {
+    const metaContent = $('meta[itemprop="ratingValue"]').attr('content');
+    if (metaContent) {
+      const n = parseFloat(metaContent.replace(',', '.'));
+      if (!isNaN(n) && n >= 1 && n <= 5) return Math.round(n * 10) / 10;
+    }
+
+    const ratingEl = $('[itemprop="ratingValue"]').first();
+    const ratingText = ratingEl.attr('content') || ratingEl.text().trim();
+    if (ratingText) {
+      const n = parseFloat(ratingText.replace(',', '.'));
+      if (!isNaN(n) && n >= 1 && n <= 5) return Math.round(n * 10) / 10;
+    }
+
+    const ratingSelectors = [
+      '.bc-rating__text',
+      '.rating-value',
+      '.stars-rating__text',
+      '.ltr-text__rating',
+    ];
+    for (const sel of ratingSelectors) {
+      const t = $(sel).first().text().trim().replace(',', '.');
+      if (t) {
+        const n = parseFloat(t);
+        if (!isNaN(n) && n >= 1 && n <= 5) return Math.round(n * 10) / 10;
+      }
+    }
+
+    return null;
   }
 
   private extractLanguage($: cheerio.CheerioAPI): string {

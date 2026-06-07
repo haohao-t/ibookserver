@@ -37,7 +37,7 @@ router.get('/:id', async (req: express.Request, res: express.Response) => {
       });
       
     } catch (error: any) {
-      console.error('❌ [Routes] Ошибка GET /:id:', error);
+      console.error('[Routes] Ошибка GET /:id:', error);
       
       if (error.message === 'Маршрут не найден') {
         return res.status(404).json({ error: 'Маршрут не найден' });

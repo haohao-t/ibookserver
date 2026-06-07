@@ -5,7 +5,6 @@ import jwt from 'jsonwebtoken';
 import pool from '../config/database';
 import { sendEmailVerificationCode, sendPasswordResetCode } from '../services/emailService';
 
-// In-memory store for pending email changes (userId → request)
 interface EmailChangeEntry {
   newEmail: string;
   code: string;
@@ -13,7 +12,6 @@ interface EmailChangeEntry {
 }
 const pendingEmailChanges = new Map<number, EmailChangeEntry>();
 
-// In-memory store for password resets (email → request)
 interface PasswordResetEntry {
   code: string;
   expiresAt: number;
@@ -23,11 +21,11 @@ const pendingPasswordResets = new Map<string, PasswordResetEntry>();
 dotenv.config();
 
 const log = {
-  info: (msg: string) => console.log('📝', msg),
+  info: (msg: string) => console.log(msg),
   success: (msg: string) => console.log('✅', msg),
-  warn: (msg: string) => console.log('⚠️', msg),
+  warn: (msg: string) => console.log(msg),
   error: (msg: string, err?: any) => console.log('❌', msg, err?.message || ''),
-  debug: (msg: string) => console.log('🔍', msg)
+  debug: (msg: string) => console.log(msg)
 };
 
 if (!process.env.JWT_SECRET) {
@@ -39,7 +37,7 @@ export const authController = {
   async register(req: Request, res: Response) {
     try {
       log.info('Регистрация: ' + req.body.email);
-      
+
       const { email, username, password, avatar_emoji } = req.body;
       const finalAvatar = avatar_emoji || '🌿';
 
@@ -48,28 +46,47 @@ export const authController = {
         return res.status(400).json({ error: 'Все поля обязательны' });
       }
 
+      if (!/^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,10}$/.test(email.trim())) {
+        log.warn('Неверный формат email');
+        return res.status(400).json({ error: 'Неверный формат email' });
+      }
+
+      const trimmedUsername = username.trim();
+      if (trimmedUsername.length < 3 || trimmedUsername.length > 30) {
+        return res.status(400).json({ error: 'Имя пользователя: от 3 до 30 символов' });
+      }
+      if (!/^[a-zA-Zа-яёА-ЯЁ0-9_]+$/.test(trimmedUsername)) {
+        return res.status(400).json({ error: 'Имя пользователя: только буквы, цифры и _' });
+      }
+
       if (password.length < 6) {
         log.warn('Короткий пароль');
         return res.status(400).json({ error: 'Пароль должен быть минимум 6 символов' });
       }
 
-      const existingUser = await pool.query(
-        'SELECT * FROM users WHERE email = $1 OR username = $2',
-        [email, username]
+      const existingEmail = await pool.query(
+        'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
+        [email.trim()]
       );
+      if (existingEmail.rows.length > 0) {
+        return res.status(400).json({ error: 'Этот email уже зарегистрирован' });
+      }
 
-      if (existingUser.rows.length > 0) {
-        log.warn('Пользователь уже существует');
-        return res.status(400).json({ error: 'Email или username уже используется' });
+      const existingUsername = await pool.query(
+        'SELECT id FROM users WHERE LOWER(username) = LOWER($1)',
+        [trimmedUsername]
+      );
+      if (existingUsername.rows.length > 0) {
+        return res.status(400).json({ error: 'Это имя пользователя уже занято' });
       }
 
       const passwordHash = await bcrypt.hash(password, 10);
-      
+
       const newUser = await pool.query(
-        `INSERT INTO users (email, username, password_hash, role, reading_goal_pages, avatar_emoji) 
-         VALUES ($1, $2, $3, 'reader', 30, $4) 
+        `INSERT INTO users (email, username, password_hash, role, reading_goal_pages, avatar_emoji)
+         VALUES ($1, $2, $3, 'reader', 30, $4)
          RETURNING id, email, username, role, avatar_emoji`,
-        [email, username, passwordHash, finalAvatar]
+        [email.trim().toLowerCase(), trimmedUsername, passwordHash, finalAvatar]
       );
 
       const user = newUser.rows[0];
@@ -81,7 +98,7 @@ export const authController = {
       );
 
       log.success('Регистрация успешна: ' + user.email);
-      
+
       res.status(201).json({
         message: 'Регистрация успешна',
         token,
@@ -96,6 +113,12 @@ export const authController = {
 
     } catch (error: any) {
       log.error('Ошибка регистрации:', error);
+      if (error.code === '23514') {
+        return res.status(400).json({ error: 'Неверный формат email' });
+      }
+      if (error.code === '23505') {
+        return res.status(400).json({ error: 'Email или username уже используется' });
+      }
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -103,7 +126,7 @@ export const authController = {
   async login(req: Request, res: Response) {
     try {
       log.info('Вход: ' + req.body.nameOrEmail);
-      
+
       const { nameOrEmail, password } = req.body;
 
       if (!nameOrEmail || !password) {
@@ -136,7 +159,7 @@ export const authController = {
       );
 
       log.success('Вход выполнен: ' + user.email);
-      
+
       res.json({
         message: 'Вход выполнен успешно',
         token,
@@ -162,7 +185,7 @@ export const authController = {
       log.info('Запрос данных пользователя: ' + userId);
 
       const userResult = await pool.query(
-        `SELECT id, email, username, role, reading_goal_pages, avatar_emoji, created_at 
+        `SELECT id, email, username, role, reading_goal_pages, avatar_emoji, created_at, birth_year
          FROM users WHERE id = $1`,
         [userId]
       );
@@ -186,18 +209,22 @@ export const authController = {
       const userId = (req as any).user.id;
       const { avatar_emoji } = req.body;
 
-      const validAvatars = ['📚', '📖', '🦉', '🐛', '📕', '⭐', '🎓', '🏆', '🌈', '🚀', '🎭', '🗡️', '🤖', '🔍', '💕', '😱', '😂', '🧙', '👩‍🚀', '🐺', '🌸', '🍃', '🌿', '💚', '✨', '🌱', '🍀', '🌙', '☕'];
-
-      if (!validAvatars.includes(avatar_emoji)) {
-        return res.status(400).json({ error: 'Неверный аватар' });
+      if (!avatar_emoji || typeof avatar_emoji !== 'string' || avatar_emoji.trim().length === 0) {
+        return res.status(400).json({ error: 'Аватар не может быть пустым' });
       }
+
+      if ([...avatar_emoji].length > 10) {
+        return res.status(400).json({ error: 'Некорректный аватар' });
+      }
+
+      const trimmedEmoji = avatar_emoji.trim();
 
       await pool.query(
         'UPDATE users SET avatar_emoji = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-        [avatar_emoji, userId]
+        [trimmedEmoji, userId]
       );
 
-      res.json({ success: true, avatar_emoji });
+      res.json({ success: true, avatar_emoji: trimmedEmoji });
     } catch (error) {
       console.error('Ошибка обновления аватара:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
@@ -210,8 +237,11 @@ export const authController = {
       const { reading_goal_pages } = req.body;
 
       const goal = Number(reading_goal_pages);
-      if (!reading_goal_pages || !Number.isInteger(goal) || goal < 1 || goal > 10000) {
-        return res.status(400).json({ error: 'Цель должна быть числом от 1 до 10000' });
+      if (!reading_goal_pages || !Number.isInteger(goal) || goal < 1) {
+        return res.status(400).json({ error: 'Цель должна быть числом больше 0' });
+      }
+      if (goal > 1000) {
+        return res.status(400).json({ error: 'Цель не может превышать 1000 страниц в день' });
       }
 
       await pool.query(
@@ -264,6 +294,30 @@ export const authController = {
       res.json({ success: true, username: trimmed });
     } catch (error) {
       console.error('Ошибка обновления имени:', error);
+      res.status(500).json({ error: 'Ошибка сервера' });
+    }
+  },
+
+  async updateBirthYear(req: Request, res: Response) {
+    try {
+      const userId = (req as any).user.id;
+      const { birth_year } = req.body;
+
+      if (birth_year === null || birth_year === undefined) {
+        await pool.query('UPDATE users SET birth_year = NULL WHERE id = $1', [userId]);
+        return res.json({ success: true, birth_year: null });
+      }
+
+      const year = parseInt(birth_year, 10);
+      const currentYear = new Date().getFullYear();
+      if (isNaN(year) || year < 1900 || year > currentYear - 5) {
+        return res.status(400).json({ error: 'Некорректный год рождения' });
+      }
+
+      await pool.query('UPDATE users SET birth_year = $1 WHERE id = $2', [year, userId]);
+      res.json({ success: true, birth_year: year });
+    } catch (error) {
+      console.error('Ошибка обновления года рождения:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -374,7 +428,6 @@ export const authController = {
         [trimmedEmail]
       );
 
-      // Always return success to not leak whether email exists
       if (userResult.rows.length === 0) {
         return res.json({ success: true, message: 'Если email зарегистрирован, код будет отправлен' });
       }

@@ -1,4 +1,3 @@
-// book_server/src/services/recommendationService.ts
 import pool from '../config/database';
 
 export interface Recommendation {
@@ -9,6 +8,9 @@ export interface Recommendation {
   description: string | null;
   reason: string | null;
   genre: string | null;
+  pages: number | null;
+  publish_year: number | null;
+  publisher: string | null;
   created_at: string;
 }
 
@@ -17,35 +19,55 @@ interface AIBook {
   author: string;
   reason?: string;
   genre?: string;
+  description?: string;
 }
 
 interface UserContext {
   totalBooks: number;
-  books: Array<{ title: string; author: string; genre: string | null; user_rating: number | null }>;
+  books: Array<{ title: string; author: string; genre: string | null; user_rating: number | null; status: string | null }>;
+  finished: Array<{ title: string; author: string; user_rating: number | null }>;
+  reading: Array<{ title: string; author: string }>;
+  wantToRead: Array<{ title: string; author: string }>;
   topRated: Array<{ title: string; author: string }>;
   favoriteAuthors: string[];
   favoriteGenres: string[];
 }
 
-// Классические книги на случай если AI недоступен или библиотека пуста
 const DEFAULT_BOOKS: AIBook[] = [
-  { title: 'Мастер и Маргарита',          author: 'Михаил Булгаков',        reason: 'Культовый роман русской литературы',          genre: 'Классика' },
-  { title: 'Дюна',                          author: 'Фрэнк Херберт',          reason: 'Лучший научно-фантастический роман XX века',   genre: 'Фантастика' },
-  { title: '1984',                          author: 'Джордж Оруэлл',          reason: 'Антиутопия, изменившая взгляд на мир',         genre: 'Антиутопия' },
-  { title: 'Маленький принц',               author: 'Антуан де Сент-Экзюпери', reason: 'Философская сказка для взрослых',              genre: 'Философия' },
-  { title: 'Преступление и наказание',      author: 'Фёдор Достоевский',      reason: 'Глубочайший психологический роман мировой литературы', genre: 'Классика' },
+  {
+    title: 'Мастер и Маргарита', author: 'Михаил Булгаков', genre: 'Классика',
+    reason: 'Один из самых читаемых русских романов XX века с уникальным сочетанием сатиры, мистики и философии.',
+    description: 'Дьявол и его свита приезжают в советскую Москву, где встречают литературных чиновников, обывателей и влюблённых. Параллельно разворачивается история Понтия Пилата и Иешуа. Роман о добре, зле, трусости и любви.',
+  },
+  {
+    title: 'Дюна', author: 'Фрэнк Херберт', genre: 'Фантастика',
+    reason: 'Эпическая космическая опера, заложившая основы жанра научной фантастики.',
+    description: 'На пустынной планете Арракис добывают редчайшее вещество во вселенной. Молодой Пол Атрейдес оказывается в центре политического заговора и начинает путь к становлению легендой. История о власти, экологии и судьбе.',
+  },
+  {
+    title: '1984', author: 'Джордж Оруэлл', genre: 'Антиутопия',
+    reason: 'Пророческий роман о тоталитаризме, актуальный как никогда.',
+    description: 'Уинстон Смит живёт в государстве, где история переписывается, мысли контролируются, а война никогда не заканчивается. Его попытка сохранить человечность в бесчеловечном мире — история о любви и сопротивлении.',
+  },
+  {
+    title: 'Маленький принц', author: 'Антуан де Сент-Экзюпери', genre: 'Философия',
+    reason: 'Тонкая философская притча, которую по-разному воспринимают в детстве и во взрослом возрасте.',
+    description: 'Маленький принц путешествует с планеты на планету и встречает разных взрослых, забывших, что важно в жизни. Трогательная история о дружбе, любви и потере, написанная лётчиком во время Второй мировой войны.',
+  },
+  {
+    title: 'Преступление и наказание', author: 'Фёдор Достоевский', genre: 'Классика',
+    reason: 'Глубочайший психологический роман о природе вины и морального выбора.',
+    description: 'Студент Раскольников совершает убийство, чтобы проверить свою теорию о «праве сильных». Роман исследует психологию преступления, муки совести и путь к искуплению через страдание.',
+  },
 ];
 
 class RecommendationService {
   private readonly CACHE_HOURS = 24;
   private readonly YANDEX_URL = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
 
-  // ── Публичные методы ────────────────────────────────────────────────────────
-
   async getRecommendations(userId: number): Promise<Recommendation[]> {
     await this.ensureTable();
 
-    // Есть свежий кэш?
     const cached = await pool.query(
       `SELECT * FROM user_recommendations
        WHERE user_id = $1
@@ -54,7 +76,7 @@ class RecommendationService {
       [userId]
     );
     if (cached.rows.length > 0) {
-      console.log(`📚 [Recommendations] Возврат из кэша (${cached.rows.length} рек.) для user ${userId}`);
+      console.log(`[Recommendations] Возврат из кэша (${cached.rows.length} рек.) для user ${userId}`);
       return cached.rows;
     }
 
@@ -63,54 +85,72 @@ class RecommendationService {
 
   async refreshRecommendations(userId: number): Promise<Recommendation[]> {
     await this.ensureTable();
+    const context = await this.getUserContext(userId);
+    if (context.totalBooks === 0) {
+      const existing = await pool.query(
+        `SELECT * FROM user_recommendations WHERE user_id = $1 AND source = 'default' ORDER BY id`,
+        [userId]
+      );
+      if (existing.rows.length > 0) {
+        await pool.query(
+          'UPDATE user_recommendations SET created_at = NOW() WHERE user_id = $1',
+          [userId]
+        );
+        return existing.rows;
+      }
+    }
     await pool.query('DELETE FROM user_recommendations WHERE user_id = $1', [userId]);
-    return this.generateAndSave(userId);
+    return this.generateAndSave(userId, context);
   }
 
-  // ── Генерация ────────────────────────────────────────────────────────────────
+  private async generateAndSave(userId: number, preloadedContext?: UserContext): Promise<Recommendation[]> {
+    console.log(`[Recommendations] Генерация рекомендаций для user ${userId}`);
 
-  private async generateAndSave(userId: number): Promise<Recommendation[]> {
-    console.log(`🤖 [Recommendations] Генерация рекомендаций для user ${userId}`);
-
-    const context = await this.getUserContext(userId);
+    const context = preloadedContext ?? await this.getUserContext(userId);
     let aiBooks: AIBook[];
+    let source: 'yandex' | 'default';
 
     if (context.totalBooks === 0) {
-      console.log('📚 [Recommendations] Библиотека пуста — используем дефолтные книги');
+      console.log('[Recommendations] Библиотека пуста — используем дефолтные книги');
       aiBooks = DEFAULT_BOOKS;
+      source = 'default';
     } else {
       const prompt = this.buildPrompt(context);
       const fromAI = await this.callYandexGPT(prompt);
-      aiBooks = fromAI.length > 0 ? fromAI : DEFAULT_BOOKS;
+      if (fromAI.length > 0) {
+        aiBooks = fromAI;
+        source = 'yandex';
+      } else {
+        aiBooks = DEFAULT_BOOKS;
+        source = 'default';
+      }
     }
 
-    // Обогащаем обложками и описанием из Google Books
     const enriched = await Promise.all(aiBooks.slice(0, 5).map(b => this.enrichWithGoogle(b)));
 
-    // Сохраняем в БД
     await pool.query('DELETE FROM user_recommendations WHERE user_id = $1', [userId]);
     const saved: Recommendation[] = [];
     for (const book of enriched) {
       try {
         const row = await pool.query(
           `INSERT INTO user_recommendations
-             (user_id, title, author, cover_url, description, reason, genre)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+             (user_id, title, author, cover_url, description, reason, genre, pages, publish_year, publisher, source)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            RETURNING *`,
           [userId, book.title, book.author, book.cover_url ?? null,
-           book.description ?? null, book.reason ?? null, book.genre ?? null]
+           book.description ?? null, book.reason ?? null, book.genre ?? null,
+           (book as any).pages ?? null, (book as any).publish_year ?? null, (book as any).publisher ?? null,
+           source]
         );
         saved.push(row.rows[0]);
       } catch (err) {
-        console.error('❌ [Recommendations] Ошибка сохранения:', err);
+        console.error('[Recommendations] Ошибка сохранения:', err);
       }
     }
 
-    console.log(`✅ [Recommendations] Сохранено ${saved.length} рекомендаций`);
+    console.log(`[Recommendations] Сохранено ${saved.length} рекомендаций (источник: ${source})`);
     return saved;
   }
-
-  // ── Контекст пользователя ────────────────────────────────────────────────────
 
   private async getUserContext(userId: number): Promise<UserContext> {
     const result = await pool.query(`
@@ -134,9 +174,11 @@ class RecommendationService {
     `, [userId]);
 
     const books = result.rows;
-    const topRated = books.filter((b: any) => b.user_rating >= 4);
+    const finished   = books.filter((b: any) => b.status === 'finished');
+    const reading    = books.filter((b: any) => b.status === 'reading');
+    const wantToRead = books.filter((b: any) => b.status === 'want_to_read');
+    const topRated   = books.filter((b: any) => b.user_rating >= 4);
 
-    // Частотный анализ авторов
     const authorCounts: Record<string, number> = {};
     books.forEach((b: any) => {
       if (b.author) authorCounts[b.author] = (authorCounts[b.author] || 0) + 1;
@@ -144,7 +186,6 @@ class RecommendationService {
     const favoriteAuthors = Object.entries(authorCounts)
       .sort((a, b) => b[1] - a[1]).slice(0, 4).map(([n]) => n);
 
-    // Частотный анализ жанров
     const genreCounts: Record<string, number> = {};
     books.forEach((b: any) => {
       if (b.genre) genreCounts[b.genre] = (genreCounts[b.genre] || 0) + 1;
@@ -152,43 +193,66 @@ class RecommendationService {
     const favoriteGenres = Object.entries(genreCounts)
       .sort((a, b) => b[1] - a[1]).slice(0, 3).map(([n]) => n);
 
-    return { totalBooks: books.length, books, topRated, favoriteAuthors, favoriteGenres };
+    return { totalBooks: books.length, books, finished, reading, wantToRead, topRated, favoriteAuthors, favoriteGenres };
   }
 
-  // ── Промпт ────────────────────────────────────────────────────────────────────
-
   private buildPrompt(ctx: UserContext): string {
-    const bookLines = ctx.books.slice(0, 15)
-      .map(b => `- «${b.title}» (${b.author || '?'})${b.user_rating ? `, оценка ${b.user_rating}/5` : ''}`)
-      .join('\n');
+    const fmtBook = (b: { title: string; author: string; user_rating?: number | null }) =>
+      `«${b.title}» (${b.author || '?'})${b.user_rating ? `, оценка ${b.user_rating}/5` : ''}`;
 
+    const finishedLines = ctx.finished.length
+      ? `Прочитано:\n${ctx.finished.slice(0, 12).map(fmtBook).join('\n')}` : '';
+    const readingLines = ctx.reading.length
+      ? `Читает сейчас:\n${ctx.reading.map(fmtBook).join('\n')}` : '';
+    const wantLines = ctx.wantToRead.length
+      ? `В планах:\n${ctx.wantToRead.slice(0, 8).map(fmtBook).join('\n')}` : '';
     const topLines = ctx.topRated.length
-      ? `\nВысоко оценённые:\n${ctx.topRated.map(b => `- «${b.title}» (${b.author})`).join('\n')}`
-      : '';
-
+      ? `Высоко оценил (≥4/5):\n${ctx.topRated.slice(0, 6).map(fmtBook).join('\n')}` : '';
     const authorsLine = ctx.favoriteAuthors.length
-      ? `\nЛюбимые авторы: ${ctx.favoriteAuthors.join(', ')}` : '';
+      ? `Любимые авторы: ${ctx.favoriteAuthors.join(', ')}` : '';
     const genresLine = ctx.favoriteGenres.length
-      ? `\nПредпочитаемые жанры: ${ctx.favoriteGenres.join(', ')}` : '';
+      ? `Предпочитаемые жанры: ${ctx.favoriteGenres.join(', ')}` : '';
 
-    return `У читателя в библиотеке есть книги:\n${bookLines}${topLines}${authorsLine}${genresLine}
+    const sections = [finishedLines, readingLines, wantLines, topLines, authorsLine, genresLine]
+      .filter(Boolean).join('\n\n');
 
-Порекомендуй ровно 5 реальных книг, которых НЕТ в списке выше. Книги должны быть опубликованы и известны. Учитывай вкусы читателя. Ответь ТОЛЬКО в JSON:
+    const allTitles = ctx.books.map(b => b.title.toLowerCase()).join(', ');
+
+    return `Профиль читателя:
+
+${sections}
+
+Все книги читателя (НЕ рекомендовать ни одну из них): ${allTitles}
+
+Порекомендуй ровно 5 реально существующих книг, которых НЕТ в списке читателя.
+
+ТРЕБОВАНИЯ:
+
+Поле "reason" (ОБЯЗАТЕЛЬНО персональное):
+- Упомяни КОНКРЕТНУЮ книгу из библиотеки читателя по названию.
+- Объясни КОНКРЕТНУЮ связь: похожий стиль, та же тема, тот же автор, продолжение идей.
+- НЕ пиши "культовый роман", "шедевр", "лучший роман" — только персональная связь.
+- Формат: "Поскольку вам [понравилась/интересна] «Книга X», вам понравится эта, потому что [конкретная связь]."
+- Длина: 1–2 предложения.
+
+Поле "description" (краткое описание сюжета):
+- 2–3 предложения: о чём книга, главный герой, основной конфликт.
+- НЕ спойлеры. Пиши как аннотация на обложке.
+
+Ответь ТОЛЬКО в JSON без комментариев:
 {
   "recommendations": [
-    { "title": "Название", "author": "Автор", "genre": "Жанр", "reason": "1-2 предложения почему эта книга подойдёт" }
+    { "title": "Название", "author": "Автор", "genre": "Жанр", "reason": "персональное объяснение", "description": "краткая аннотация" }
   ]
 }`;
   }
-
-  // ── YandexGPT ────────────────────────────────────────────────────────────────
 
   private async callYandexGPT(prompt: string): Promise<AIBook[]> {
     const folderId = process.env.YANDEX_FOLDER_ID || '';
     const apiKey   = process.env.YANDEX_API_KEY   || '';
 
     if (!folderId || !apiKey) {
-      console.warn('⚠️ [Recommendations] YandexGPT не настроен, используем дефолт');
+      console.warn('[Recommendations] YandexGPT не настроен, используем дефолт');
       return [];
     }
 
@@ -212,7 +276,7 @@ class RecommendationService {
       });
 
       if (!response.ok) {
-        console.error('❌ [Recommendations] YandexGPT статус:', response.status);
+        console.error('[Recommendations] YandexGPT статус:', response.status);
         return [];
       }
 
@@ -220,51 +284,102 @@ class RecommendationService {
       const text: string = data.result?.alternatives?.[0]?.message?.text ?? '';
 
       const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) { console.error('❌ [Recommendations] JSON не найден в ответе'); return []; }
+      if (!jsonMatch) { console.error('[Recommendations] JSON не найден в ответе'); return []; }
 
       const parsed = JSON.parse(jsonMatch[0]);
       const recs: AIBook[] = parsed.recommendations ?? parsed.books ?? [];
 
-      console.log(`✅ [Recommendations] YandexGPT вернул ${recs.length} рекомендаций`);
+      console.log(`[Recommendations] YandexGPT вернул ${recs.length} рекомендаций`);
       return recs;
 
     } catch (err: any) {
-      console.error('❌ [Recommendations] Ошибка YandexGPT:', err.message);
+      console.error('[Recommendations] Ошибка YandexGPT:', err.message);
       return [];
     }
   }
 
-  // ── Google Books (обложка + описание) ───────────────────────────────────────
-
   private async enrichWithGoogle(book: AIBook): Promise<AIBook & {
-    cover_url: string | undefined; description: string | undefined;
+    cover_url: string | undefined;
+    description: string | undefined;
+    pages: number | undefined;
+    publish_year: number | undefined;
+    publisher: string | undefined;
   }> {
     const apiKey = process.env.GOOGLE_BOOKS_API_KEY || '';
-    const q      = encodeURIComponent(`${book.title} ${book.author}`);
-    const url    = `https://www.googleapis.com/books/v1/volumes?q=${q}&maxResults=1${apiKey ? `&key=${apiKey}` : ''}`;
+    const blank = {
+      ...book,
+      cover_url: undefined as string | undefined,
+      pages: undefined as number | undefined,
+      publish_year: undefined as number | undefined,
+      publisher: undefined as string | undefined,
+    } as AIBook & { cover_url: string | undefined; description: string | undefined; pages: number | undefined; publish_year: number | undefined; publisher: string | undefined };
 
-    try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const trySearch = async (q: string) => {
+      const url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=3${apiKey ? `&key=${apiKey}` : ''}`;
+      const resp = await fetch(url, { signal: AbortSignal.timeout(6000) });
       const data: any = await resp.json();
-      const vol  = data.items?.[0]?.volumeInfo;
+      return (data.items ?? []) as any[];
+    };
 
-      if (!vol) return { ...book, cover_url: undefined, description: undefined };
-
-      const cover_url: string | undefined =
+    const pickCover = (vol: any): string | undefined => {
+      const raw =
         vol.imageLinks?.extraLarge ??
         vol.imageLinks?.large      ??
         vol.imageLinks?.medium     ??
         vol.imageLinks?.thumbnail;
+      return raw
+        ? raw.replace(/^http:\/\//, 'https://').replace('&edge=curl', '').replace('zoom=1', 'zoom=3')
+        : undefined;
+    };
 
-      const description: string | undefined = vol.description;
+    try {
+      let items = await trySearch(`intitle:"${book.title}" inauthor:"${book.author}"`);
+      // Fallback: unquoted search
+      if (!items.length) items = await trySearch(`${book.title} ${book.author}`);
 
-      return { ...book, cover_url, description };
+      const vol = items.find((i: any) => pickCover(i.volumeInfo))?.volumeInfo
+               ?? items[0]?.volumeInfo;
+
+      let cover_url: string | undefined;
+      let description: string | undefined;
+      let pages: number | undefined;
+      let publish_year: number | undefined;
+      let publisher: string | undefined;
+
+      if (vol) {
+        cover_url   = pickCover(vol);
+        description = vol.description || book.description;
+        pages       = vol.pageCount || undefined;
+        publish_year = vol.publishedDate ? (parseInt(vol.publishedDate.substring(0, 4)) || undefined) : undefined;
+        publisher   = vol.publisher || undefined;
+      } else {
+        description = book.description;
+      }
+
+      if (!cover_url) {
+        cover_url = await this.fetchOpenLibraryCover(book.title, book.author);
+      }
+
+      return { ...book, cover_url, description, pages, publish_year, publisher } as AIBook & { cover_url: string | undefined; description: string | undefined; pages: number | undefined; publish_year: number | undefined; publisher: string | undefined };
     } catch {
-      return { ...book, cover_url: undefined, description: undefined };
+      return blank;
     }
   }
 
-  // ── Создание таблицы при первом запуске ──────────────────────────────────────
+  private async fetchOpenLibraryCover(title: string, author: string): Promise<string | undefined> {
+    try {
+      const q = encodeURIComponent(`${title} ${author}`);
+      const resp = await fetch(
+        `https://openlibrary.org/search.json?q=${q}&fields=cover_i&limit=3`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      const data: any = await resp.json();
+      const coverId = data.docs?.find((d: any) => d.cover_i)?.cover_i;
+      if (coverId) return `https://covers.openlibrary.org/b/id/${coverId}-L.jpg`;
+    } catch {
+    }
+    return undefined;
+  }
 
   private tableChecked = false;
 
@@ -281,16 +396,23 @@ class RecommendationService {
           description TEXT,
           reason      TEXT,
           genre       VARCHAR(200),
+          pages       INTEGER,
+          publish_year INTEGER,
+          publisher   VARCHAR(300),
           created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       `);
+      await pool.query(`ALTER TABLE user_recommendations ADD COLUMN IF NOT EXISTS pages INTEGER`);
+      await pool.query(`ALTER TABLE user_recommendations ADD COLUMN IF NOT EXISTS publish_year INTEGER`);
+      await pool.query(`ALTER TABLE user_recommendations ADD COLUMN IF NOT EXISTS publisher VARCHAR(300)`);
+      await pool.query(`ALTER TABLE user_recommendations ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'default'`);
       await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_user_recommendations_user_id
           ON user_recommendations(user_id)
       `);
       this.tableChecked = true;
     } catch (err) {
-      console.error('❌ [Recommendations] Ошибка создания таблицы:', err);
+      console.error('[Recommendations] Ошибка создания таблицы:', err);
     }
   }
 }

@@ -17,10 +17,10 @@ export async function sendPasswordResetCode(
   code: string,
   username: string,
 ): Promise<void> {
-  console.log(`\n🔑 [EMAIL] Код сброса пароля для ${to}: ${code}\n`);
+  console.log(`\n[EMAIL] Код сброса пароля для ${to}: ${code}\n`);
 
   if (!process.env.SMTP_PASS) {
-    console.warn('⚠️ [EMAIL] SMTP_PASS не задан — письмо не отправлено');
+    console.warn('[EMAIL] SMTP_PASS не задан — письмо не отправлено');
     return;
   }
 
@@ -45,9 +45,9 @@ export async function sendPasswordResetCode(
       subject: 'Сброс пароля',
       html,
     });
-    console.log(`🔑 [EMAIL] Письмо отправлено: ${info.messageId}`);
+    console.log(`[EMAIL] Письмо отправлено: ${info.messageId}`);
   } catch (err: any) {
-    console.error('🔑 [EMAIL] Ошибка отправки:', err.message);
+    console.error('[EMAIL] Ошибка отправки:', err.message);
   }
 }
 
@@ -56,10 +56,10 @@ export async function sendEmailVerificationCode(
   code: string,
   username: string,
 ): Promise<void> {
-  console.log(`\n📧 [EMAIL] Код подтверждения для ${to}: ${code}\n`);
+  console.log(`\n[EMAIL] Код подтверждения для ${to}: ${code}\n`);
 
   if (!process.env.SMTP_PASS) {
-    console.warn('⚠️ [EMAIL] SMTP_PASS не задан — письмо не отправлено');
+    console.warn('[EMAIL] SMTP_PASS не задан — письмо не отправлено');
     return;
   }
 
@@ -84,8 +84,8 @@ export async function sendEmailVerificationCode(
       subject: 'Код подтверждения',
       html,
     });
-    console.log(`📧 [EMAIL] Письмо отправлено: ${info.messageId}`);
+    console.log(`[EMAIL] Письмо отправлено: ${info.messageId}`);
   } catch (err: any) {
-    console.error('📧 [EMAIL] Ошибка отправки:', err.message);
+    console.error('[EMAIL] Ошибка отправки:', err.message);
   }
 }

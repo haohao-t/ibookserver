@@ -2,7 +2,6 @@ import { Pool } from 'pg';
 import dotenv from 'dotenv';
 import path from 'path';
 
-// Загружаем .env прямо здесь — database.ts инициализируется раньше dotenv.config() в index.ts
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
 const isCloud = !!process.env.DATABASE_URL;
@@ -32,20 +31,17 @@ const pool = new Pool(
       }
 );
 
+pool.on('error', (err: any) => {
+  if (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED') return;
+  console.error('Ошибка пула:', err.message);
+});
+
 pool.query('SELECT 1 + 1 AS result', (err, res) => {
   if (err) {
-    console.error('\n❌ ОШИБКА ПОДКЛЮЧЕНИЯ К БД:');
+    console.error('\nОШИБКА ПОДКЛЮЧЕНИЯ К БД:');
     console.error('   ', err.message);
-    console.error('\n📌 ЧТО ДЕЛАТЬ:');
-    console.error('   1. Проверьте, запущен ли PostgreSQL:');
-    console.error('      Win+R → services.msc → PostgreSQL → Запустить');
-    console.error('   2. Проверьте пароль в pgAdmin:');
-    console.error('      Откройте pgAdmin → Servers → PostgreSQL → Connect');
-    console.error('   3. Создайте базу данных вручную:');
-    console.error('      psql -U postgres -c "CREATE DATABASE person_liprary;"');
-    console.error('   4. Временно отключите брандмауэр');
   } else {
-    console.log('\n✅ База данных ПОДКЛЮЧЕНА!');
+    console.log('\nБаза данных ПОДКЛЮЧЕНА!');
     console.log('   Тестовый запрос:', res.rows[0]);
   }
 });

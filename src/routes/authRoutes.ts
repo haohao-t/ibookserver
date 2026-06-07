@@ -12,6 +12,7 @@ router.get('/me', authMiddleware, authController.getMe);
 router.patch('/me/avatar', authMiddleware, authController.updateAvatar);
 router.patch('/me/goal', authMiddleware, authController.updateReadingGoal);
 router.patch('/me/username', authMiddleware, authController.updateUsername);
+router.patch('/me/birth-year', authMiddleware, authController.updateBirthYear);
 router.post('/me/email/request', authMiddleware, authController.requestEmailChange);
 router.post('/me/email/confirm', authMiddleware, authController.confirmEmailChange);
 

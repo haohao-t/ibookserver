@@ -2,47 +2,28 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
-import swaggerUi from 'swagger-ui-express';
 import bookRoutes from './routes/bookRoutes';
 import authRoutes from './routes/authRoutes';
 import aiRoutes from './routes/aiRoutes';
 import adminRoutes from './routes/adminRoutes';
-import { swaggerSpec } from './swagger';
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
-// Swagger UI (документация API)
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
-  explorer: true,
-  customCss: '.swagger-ui .topbar { display: none }',
-  customSiteTitle: 'API документация - Персональная библиотека'
-}));
-
-// JSON-версия спецификации Swagger
-app.get('/api-docs.json', (req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  res.send(swaggerSpec);
-});
-
-// Маршруты API
 app.use('/api/books', bookRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api', aiRoutes);
 app.use('/api/admin', adminRoutes);
 
-// Корневой маршрут
 app.get('/', (req, res) => {
-  res.json({ 
+  res.json({
     message: 'API интеллектуальной библиотеки',
-    documentation: 'http://localhost:3000/api-docs',
     endpoints: {
       auth: ['POST /api/auth/register', 'POST /api/auth/login', 'GET /api/auth/me'],
       books: [
@@ -76,14 +57,15 @@ app.get('/', (req, res) => {
         'PATCH /api/books/routes/:id/books/order',
         'PATCH /api/books/routes/:id/books',
         'PATCH /api/books/routes/:id/activate',
-        'PATCH /api/books/routes/:id/complete'
-      ]
-    }
+        'PATCH /api/books/routes/:id/complete',
+      ],
+    },
   });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n Сервер запущен на http://localhost:${PORT}`);
-  console.log(` Документация API: http://localhost:${PORT}/api-docs`);
-  console.log(` Доступен в сети по IP: ${require('os').networkInterfaces()['Беспроводная сеть']?.[1]?.address || 'не найден'}`);
+  console.log(
+    ` Доступен в сети по IP: ${require('os').networkInterfaces()['Беспроводная сеть']?.[1]?.address || 'не найден'}`,
+  );
 });

@@ -4,53 +4,105 @@ import axios from 'axios';
 import pool from '../config/database';
 import { enhancedBookApiService } from '../services/enhancedBookApiService';
 import { recommendationService } from '../services/recommendationService';
+import { searchBooks } from '../services/bookSearchService';
 
-async function findOrCreateWork(title: string, authorName: string): Promise<number> {
-  let authorResult = await pool.query(
-    'SELECT id FROM authors WHERE LOWER(full_name) = LOWER($1)',
-    [authorName]
+async function findOrCreateAuthor(rawName: string): Promise<number> {
+  const normalized = rawName.trim().replace(/\s+/g, ' ') || 'Неизвестный автор';
+  const sel = await pool.query('SELECT id FROM authors WHERE LOWER(full_name) = LOWER($1)', [normalized]);
+  if (sel.rows.length > 0) return sel.rows[0].id;
+
+  const ins = await pool.query(
+    `INSERT INTO authors (full_name) VALUES ($1) ON CONFLICT (full_name) DO NOTHING RETURNING id`,
+    [normalized]
   );
-  
-  let authorId;
-  if (authorResult.rows.length === 0) {
-    const newAuthor = await pool.query(
-      'INSERT INTO authors (full_name) VALUES ($1) RETURNING id',
-      [authorName]
-    );
-    authorId = newAuthor.rows[0].id;
-    console.log(`📚 Создан новый автор: ${authorName}, ID: ${authorId}`);
-  } else {
-    authorId = authorResult.rows[0].id;
-  }
+  if (ins.rows.length > 0) return ins.rows[0].id;
 
-  let workResult = await pool.query(
+  const retry = await pool.query('SELECT id FROM authors WHERE LOWER(full_name) = LOWER($1)', [normalized]);
+  return retry.rows[0].id;
+}
+
+async function findOrCreateWork(title: string, authorName: string, createdByUserId?: number, genre?: string | null): Promise<number> {
+  const normalizedAuthor = authorName.trim().replace(/\s+/g, ' ') || 'Неизвестный автор';
+  const normalizedTitle = title.trim().replace(/\s+/g, ' ');
+
+  const authorId = await findOrCreateAuthor(normalizedAuthor);
+
+  const workResult = await pool.query(
     'SELECT id FROM works WHERE LOWER(title) = LOWER($1) AND author_id = $2',
-    [title, authorId]
+    [normalizedTitle, authorId]
   );
 
   let workId;
   if (workResult.rows.length === 0) {
     const newWork = await pool.query(
-      'INSERT INTO works (title, author_id) VALUES ($1, $2) RETURNING id',
-      [title, authorId]
+      `INSERT INTO works (title, author_id, created_by_user_id, genre)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [normalizedTitle, authorId, createdByUserId ?? null, genre ?? null]
     );
     workId = newWork.rows[0].id;
-    console.log(`📚 Создано новое произведение: ${title}, ID: ${workId}`);
   } else {
     workId = workResult.rows[0].id;
+    if (genre) {
+      await pool.query(
+        'UPDATE works SET genre = $1 WHERE id = $2 AND (genre IS NULL OR genre = \'\')',
+        [genre, workId]
+      );
+    }
   }
 
   return workId;
 }
 
+async function upsertWorkAuthors(workId: number, authorsList: string[]): Promise<void> {
+  const clean = authorsList.map(a => a.trim().replace(/\s+/g, ' ')).filter(Boolean);
+  if (clean.length === 0) return;
+
+  await pool.query('DELETE FROM work_authors WHERE work_id = $1', [workId]);
+
+  for (let i = 0; i < clean.length; i++) {
+    const name = clean[i] as string;
+    const authorId = await findOrCreateAuthor(name);
+    await pool.query(
+      `INSERT INTO work_authors (work_id, author_id, sort_order)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (work_id, author_id) DO UPDATE SET sort_order = EXCLUDED.sort_order`,
+      [workId, authorId, i]
+    );
+  }
+
+  const firstRes = await pool.query(
+    `SELECT id FROM authors WHERE LOWER(full_name) = LOWER($1) LIMIT 1`,
+    [clean[0]]
+  );
+  if (firstRes.rows.length > 0) {
+    await pool.query('UPDATE works SET author_id = $1 WHERE id = $2', [firstRes.rows[0].id, workId]);
+  }
+}
+
 async function findOrCreateEdition(workId: number, bookData: any, isbn: string): Promise<number> {
   let editionResult = await pool.query(
-    'SELECT id FROM editions WHERE isbn = $1',
+    'SELECT id, pages, publisher, publish_year FROM editions WHERE isbn = $1',
     [isbn]
   );
 
   if (editionResult.rows.length > 0) {
-    return editionResult.rows[0].id;
+    const ed = editionResult.rows[0];
+    const needsUpdate =
+      (!ed.pages && bookData.pages) ||
+      (!ed.publisher && bookData.publisher) ||
+      (!ed.publish_year && bookData.publish_year);
+    if (needsUpdate) {
+      await pool.query(
+        `UPDATE editions SET
+           pages        = COALESCE(NULLIF(pages, 0),        $1::int),
+           publisher    = COALESCE(NULLIF(publisher, ''),   $2::text),
+           publish_year = COALESCE(NULLIF(publish_year, 0), $3::int),
+           cover_url    = COALESCE(cover_url,               $4::text)
+         WHERE id = $5`,
+        [bookData.pages || null, bookData.publisher || null, bookData.publish_year || null, bookData.coverUrl || null, ed.id]
+      );
+    }
+    return ed.id;
   }
 
   const newEdition = await pool.query(
@@ -69,7 +121,7 @@ async function findOrCreateEdition(workId: number, bookData: any, isbn: string):
     ]
   );
 
-  console.log(`📚 Создано новое издание, ID: ${newEdition.rows[0].id}`);
+  console.log(`Создано новое издание, ID: ${newEdition.rows[0].id}`);
   return newEdition.rows[0].id;
 }
 
@@ -79,9 +131,9 @@ export const bookController = {
       const { isbn } = req.body;
       const userId = (req as any).user.id;
   
-      console.log('\n📚 [Controller] ========== ДОБАВЛЕНИЕ КНИГИ ==========');
-      console.log('📚 [Controller] User ID:', userId);
-      console.log('📚 [Controller] ISBN:', isbn);
+      console.log('\n[Controller] ========== ДОБАВЛЕНИЕ КНИГИ ==========');
+      console.log('[Controller] User ID:', userId);
+      console.log('[Controller] ISBN:', isbn);
   
       if (!isbn) {
         return res.status(400).json({ error: 'ISBN не указан' });
@@ -99,7 +151,7 @@ export const bookController = {
       );
   
       if (userEditionCheck.rows.length > 0) {
-        console.log('📚 [Controller] ⚠️ Книга уже есть у пользователя');
+        console.log('[Controller] Книга уже есть у пользователя');
         return res.status(200).json({
           success: true,
           message: 'Книга уже в вашей библиотеке',
@@ -119,7 +171,7 @@ export const bookController = {
       let workTitle = '';
   
       if (editionResult.rows.length === 0) {
-        console.log('📚 [Controller] Издание не найдено в БД, ищем в API...');
+        console.log('[Controller] Издание не найдено в БД, ищем в API...');
         
         const bookData = await enhancedBookApiService.findBookByISBN(cleanIsbn);
   
@@ -131,9 +183,14 @@ export const bookController = {
   
         workTitle = bookData.title;
         const authorName = bookData.authors?.[0] || 'Неизвестный автор';
-        
-        workId = await findOrCreateWork(workTitle, authorName);
-        
+        const primaryGenre = bookData.genres?.[0] ?? null;
+
+        workId = await findOrCreateWork(workTitle, authorName, undefined, primaryGenre);
+
+        if (bookData.authors && bookData.authors.length > 0) {
+          await upsertWorkAuthors(workId, bookData.authors);
+        }
+
         editionId = await findOrCreateEdition(workId, bookData, cleanIsbn);
         
       } else {
@@ -143,9 +200,9 @@ export const bookController = {
           [editionId]
         );
         workTitle = workInfo.rows[0]?.title || '';
-        console.log('📚 [Controller] Издание уже есть в БД, ID:', editionId);
+        console.log('[Controller] Издание уже есть в БД, ID:', editionId);
       }
-  
+
       const libraryResult = await pool.query(
         `INSERT INTO user_library (user_id, edition_id, added_via, added_at)
          VALUES ($1, $2, 'isbn_scan', CURRENT_TIMESTAMP)
@@ -162,7 +219,7 @@ export const bookController = {
           [userId, editionId]
         );
 
-        console.log('📚 [Controller] ✅ Книга добавлена в библиотеку пользователя');
+        console.log('[Controller] Книга добавлена в библиотеку пользователя');
         res.status(201).json({
           success: true,
           message: 'Книга добавлена в библиотеку',
@@ -173,7 +230,7 @@ export const bookController = {
           alreadyExists: false
         });
       } else {
-        console.log('📚 [Controller] ⚠️ Книга уже была в библиотеке пользователя');
+        console.log('[Controller] Книга уже была в библиотеке пользователя');
         const existingLib = await pool.query(
           'SELECT id FROM user_library WHERE user_id = $1 AND edition_id = $2',
           [userId, editionId]
@@ -187,9 +244,9 @@ export const bookController = {
           alreadyExists: true
         });
       }
-  
+
     } catch (error) {
-      console.error('❌ Ошибка добавления книги:', error);
+      console.error('Ошибка добавления книги:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -208,8 +265,20 @@ export const bookController = {
     }
   },
 
+  async searchBooksByQuery(req: Request, res: Response) {
+    const q = (req.query.q as string || '').trim();
+    if (!q) return res.status(400).json({ error: 'Параметр q обязателен' });
+    try {
+      const results = await searchBooks(q);
+      res.json({ results });
+    } catch (err) {
+      console.error('[searchBooksByQuery] Ошибка:', err);
+      res.status(500).json({ error: 'Ошибка поиска' });
+    }
+  },
+
   async searchBookByISBN(req: Request, res: Response) {
-    console.log('\n🔵 [Controller] ========== ПОИСК КНИГИ ==========');
+    console.log('\n[Controller] ========== ПОИСК КНИГИ ==========');
     
     try {
       const isbnParam = req.params.isbn;
@@ -242,7 +311,7 @@ export const bookController = {
       });
 
     } catch (error) {
-      console.error('🔵 [Controller] ❌ Ошибка:', error);
+      console.error('[Controller] Ошибка:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -267,12 +336,13 @@ export const bookController = {
           e.series,
           w.id as work_id,
           w.title,
-          w.description as work_description,
-          w.genre,
-          a.full_name as author,
+          COALESCE(ul.custom_description, w.description) as work_description,
+          COALESCE(ul.custom_genre, w.genre) as genre,
+          COALESCE((SELECT STRING_AGG(a2.full_name, ', ' ORDER BY wa.sort_order) FROM work_authors wa JOIN authors a2 ON a2.id = wa.author_id WHERE wa.work_id = w.id), a.full_name) as author,
           rp.status,
           rp.current_page,
           rp.user_rating,
+          rp.user_review,
           rp.started_at,
           rp.finished_at,
           ul.added_at,
@@ -298,7 +368,7 @@ export const bookController = {
       res.json(result.rows);
       
     } catch (error) {
-      console.error('❌ Ошибка получения книг:', error);
+      console.error('Ошибка получения книг:', error);
       res.status(500).json({ error: 'Ошибка сервера при получении книг' });
     }
   },
@@ -314,6 +384,9 @@ export const bookController = {
         const p = Number(current_page);
         if (!Number.isInteger(p) || p < 0) {
           return res.status(400).json({ error: 'current_page должен быть неотрицательным целым числом' });
+        }
+        if (p > 10000) {
+          return res.status(400).json({ error: 'Количество страниц не может превышать 10 000' });
         }
       }
 
@@ -339,13 +412,11 @@ export const bookController = {
       const currentStartedAt = currentProgress.rows[0]?.started_at;
       const currentFinishedAt= currentProgress.rows[0]?.finished_at;
 
-      // Допустимые статусы
       const VALID_STATUSES = ['want_to_read', 'reading', 'finished', 'paused', 'abandoned'];
       const newStatus = (status && VALID_STATUSES.includes(status))
         ? status
         : (currentStatus || 'want_to_read');
 
-      // Рейтинг: только для 'finished'
       let finalRating = user_rating;
       if (newStatus !== 'finished') {
         finalRating = null;
@@ -356,7 +427,6 @@ export const bookController = {
         finalRating = null;
       }
 
-      // started_at: авто-установка при первом переходе в 'reading'
       let newStartedAt: Date | null = currentStartedAt || null;
       if (reqStartedAt !== undefined) {
         newStartedAt = reqStartedAt ? new Date(reqStartedAt) : null;
@@ -364,7 +434,6 @@ export const bookController = {
         newStartedAt = new Date();
       }
 
-      // finished_at: авто-установка при 'finished', сохраняем если уже было
       let newFinishedAt: Date | null;
       if (reqFinishedAt !== undefined) {
         newFinishedAt = reqFinishedAt ? new Date(reqFinishedAt) : null;
@@ -409,7 +478,7 @@ export const bookController = {
         return res.status(404).json({ error: 'Запись не найдена' });
       }
   
-      console.log('[updateProgress] ✅ Прогресс обновлен:', result.rows[0]);
+      console.log('[updateProgress] Прогресс обновлен:', result.rows[0]);
       
       res.json({ 
         success: true, 
@@ -515,11 +584,11 @@ export const bookController = {
 
       await pool.query('DELETE FROM book_notes WHERE id = $1', [noteId]);
 
-      console.log('[Controller] ✅ Заметка удалена');
+      console.log('[Controller] Заметка удалена');
       res.json({ success: true, message: 'Заметка удалена' });
 
     } catch (error) {
-      console.error('❌ Ошибка удаления заметки:', error);
+      console.error('Ошибка удаления заметки:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -527,7 +596,6 @@ export const bookController = {
   async getAllNotes(req: Request, res: Response) {
     try {
       const userId = (req as any).user.id;
-      // ensure column exists (idempotent)
       await pool.query(
         `ALTER TABLE book_notes ADD COLUMN IF NOT EXISTS is_favorite boolean NOT NULL DEFAULT false`
       );
@@ -593,7 +661,6 @@ export const bookController = {
         [libraryId, userId]
       );
       if (libCheck.rows.length === 0) return res.status(404).json({ error: 'Книга не найдена' });
-      // only delete non-favorite notes
       const result = await pool.query(
         `DELETE FROM book_notes WHERE user_library_id = $1 AND is_favorite = false`,
         [libraryId]
@@ -641,15 +708,13 @@ export const bookController = {
   async createCollection(req: Request, res: Response) {
     try {
       const userId = (req as any).user.id;
-      const { name, description } = req.body; // убрал is_private, так как его нет в таблице
+      const { name, description } = req.body;  
   
       console.log('[createCollection]', { userId, name, description });
   
       if (!name) {
         return res.status(400).json({ error: 'Название коллекции обязательно' });
       }
-  
-      // Проверяем, есть ли уже коллекция с таким именем у пользователя
       const existingCheck = await pool.query(
         'SELECT id FROM user_collections WHERE user_id = $1 AND name = $2',
         [userId, name]
@@ -659,15 +724,14 @@ export const bookController = {
         return res.status(400).json({ error: 'Коллекция с таким именем уже существует' });
       }
   
-      // Исправлено: только 3 параметра (user_id, name, description)
       const result = await pool.query(
         `INSERT INTO user_collections (user_id, name, description) 
          VALUES ($1, $2, $3) 
          RETURNING *`,
-        [userId, name, description || null] // description может быть null
+        [userId, name, description || null]
       );
   
-      console.log('[createCollection] ✅ Коллекция создана:', result.rows[0]);
+      console.log('[createCollection] Коллекция создана:', result.rows[0]);
       
       res.status(201).json({ 
         success: true, 
@@ -721,7 +785,7 @@ export const bookController = {
         return res.status(400).json({ error: 'Книга уже в коллекции' });
       }
   
-      console.log('[addBookToCollection] ✅ Книга добавлена в коллекцию');
+      console.log('[addBookToCollection] Книга добавлена в коллекцию');
       res.json({ success: true, message: 'Книга добавлена в коллекцию' });
   
     } catch (error) {
@@ -806,15 +870,15 @@ export const bookController = {
       );
 
       const topAuthors = await pool.query(
-        `SELECT 
-           a.full_name as author,
+        `SELECT
+           COALESCE((SELECT STRING_AGG(a2.full_name, ', ' ORDER BY wa.sort_order) FROM work_authors wa JOIN authors a2 ON a2.id = wa.author_id WHERE wa.work_id = w.id), a.full_name) as author,
            COUNT(*) as books_read
          FROM reading_progress rp
          JOIN editions e ON rp.edition_id = e.id
          JOIN works w ON e.work_id = w.id
          JOIN authors a ON w.author_id = a.id
          WHERE rp.user_id = $1 AND rp.status = 'finished'
-         GROUP BY a.id
+         GROUP BY a.id, w.id
          ORDER BY books_read DESC
          LIMIT 5`,
         [userId]
@@ -843,7 +907,7 @@ export const bookController = {
            e.cover_url,
            w.id as work_id,
            w.title,
-           a.full_name as author,
+           COALESCE((SELECT STRING_AGG(a2.full_name, ', ' ORDER BY wa.sort_order) FROM work_authors wa JOIN authors a2 ON a2.id = wa.author_id WHERE wa.work_id = w.id), a.full_name) as author,
            rp.finished_at,
            rp.user_rating
          FROM reading_progress rp
@@ -920,7 +984,7 @@ export const bookController = {
       res.json(collection);
 
     } catch (error) {
-      console.error('❌ Ошибка получения коллекции:', error);
+      console.error('Ошибка получения коллекции:', error);
       res.status(500).json({ error: 'Ошибка сервера при получении коллекции' });
     }
   },
@@ -963,7 +1027,7 @@ export const bookController = {
         return res.status(404).json({ error: 'Книга не найдена в коллекции' });
       }
   
-      console.log('[removeBookFromCollection] ✅ Книга удалена из коллекции');
+      console.log('[removeBookFromCollection] Книга удалена из коллекции');
       res.json({ success: true, message: 'Книга удалена из коллекции' });
   
     } catch (error) {
@@ -1020,11 +1084,10 @@ export const bookController = {
       }
       
       const userId = (req as any).user.id;
-      const { name, description } = req.body; // убрал is_private
+      const { name, description } = req.body; 
   
       console.log('[updateCollection]', { collectionId, userId, name, description });
   
-      // Проверяем существование коллекции
       const checkRes = await pool.query(
         'SELECT id FROM user_collections WHERE id = $1 AND user_id = $2',
         [collectionId, userId]
@@ -1034,7 +1097,6 @@ export const bookController = {
         return res.status(404).json({ error: 'Коллекция не найдена' });
       }
   
-      // Проверяем уникальность имени (если имя меняется)
       if (name) {
         const nameCheck = await pool.query(
           'SELECT id FROM user_collections WHERE user_id = $1 AND name = $2 AND id != $3',
@@ -1045,7 +1107,6 @@ export const bookController = {
         }
       }
   
-      // Исправлено: только 3 параметра обновления
       const result = await pool.query(
         `UPDATE user_collections 
          SET 
@@ -1095,7 +1156,7 @@ export const bookController = {
           e.id as edition_id,
           e.cover_url,
           w.title,
-          a.full_name as author
+          COALESCE((SELECT STRING_AGG(a2.full_name, ', ' ORDER BY wa.sort_order) FROM work_authors wa JOIN authors a2 ON a2.id = wa.author_id WHERE wa.work_id = w.id), a.full_name) as author
          FROM user_library ul
          JOIN editions e ON ul.edition_id = e.id
          JOIN works w ON e.work_id = w.id
@@ -1121,33 +1182,35 @@ export const bookController = {
   async addManualBook(req: Request, res: Response) {
     try {
       const userId = (req as any).user.id;
-      const { isbn, title, authors, pages, publisher, publish_year, description, cover_url, language, genre, series, forceUpdate, format } = req.body;
+      const { isbn, title, authors, pages, publisher, publish_year, description, cover_url, language, series, forceUpdate, format, added_via: addedVia } = req.body;
+      const genreRaw = req.body.genre;
+      const genre: string | null = Array.isArray(genreRaw)
+        ? (genreRaw.filter(Boolean).join(', ') || null)
+        : (typeof genreRaw === 'string' ? genreRaw.trim() || null : null);
       const bookFormat = (typeof format === 'string' && ['physical','digital','audio'].includes(format)) ? format : 'physical';
+      const bookAddedVia = (typeof addedVia === 'string' && addedVia.trim()) ? addedVia.trim() : 'manual';
 
-      console.log('\n📚 [Controller] ========== ДОБАВЛЕНИЕ КНИГИ ВРУЧНУЮ ==========');
-      console.log('📚 [Controller] User ID:', userId);
-      console.log('📚 [Controller] ISBN:', isbn);
-      console.log('📚 [Controller] Title:', title);
+      console.log('\n[Controller] ========== ДОБАВЛЕНИЕ КНИГИ ВРУЧНУЮ ==========');
+      console.log('[Controller] User ID:', userId);
+      console.log('[Controller] ISBN:', isbn);
+      console.log('[Controller] Title:', title);
 
       if (!title) {
         return res.status(400).json({ error: 'Название книги обязательно' });
       }
 
-      // Объединяем всех авторов через ", " — хранится как единая строка
-      const authorName = authors?.filter((a: string) => a?.trim()).join(', ') || 'Неизвестный автор';
+      const cleanTitle = title.trim();
+      if (cleanTitle.length < 2 || !/[а-яёa-z]/i.test(cleanTitle)) {
+        return res.status(400).json({ error: 'Название книги не может быть таким коротким или содержать только символы' });
+      }
 
-      // ── Путь 1: без ISBN → создаём произведение + издание (чтобы сохранить стр., изд-во, обложку) ──
+      const cleanAuthors = authors?.filter((a: string) => a?.trim()) ?? [];
+      const authorName = cleanAuthors[0] || 'Неизвестный автор';
+
       if (!isbn || !isbn.trim()) {
-        const workId = await findOrCreateWork(title, authorName);
+        const workId = await findOrCreateWork(title, authorName, userId);
+        await upsertWorkAuthors(workId, cleanAuthors);
 
-        if (genre || description) {
-          await pool.query(
-            'UPDATE works SET genre = COALESCE($1, genre), description = COALESCE($2, description) WHERE id = $3',
-            [genre || null, description || null, workId]
-          );
-        }
-
-        // Ищем существующее издание без ISBN для этого произведения
         const existEdRes = await pool.query(
           'SELECT id FROM editions WHERE work_id = $1 AND isbn IS NULL LIMIT 1',
           [workId]
@@ -1156,7 +1219,6 @@ export const bookController = {
         let editionId: number;
         if (existEdRes.rows.length > 0) {
           editionId = existEdRes.rows[0].id;
-          // Обновляем данные, не затирая уже заполненные поля
           await pool.query(
             `UPDATE editions SET
                pages        = CASE WHEN $1::int  IS NOT NULL THEN $1::int  ELSE pages        END,
@@ -1169,7 +1231,6 @@ export const bookController = {
             [pages || null, publisher || null, publish_year || null, cover_url || null, language || null, editionId, series || null]
           );
         } else {
-          // Создаём новое издание без ISBN
           const newEdRes = await pool.query(
             `INSERT INTO editions (work_id, publisher, publish_year, pages, cover_url, language, series)
              VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
@@ -1178,7 +1239,6 @@ export const bookController = {
           editionId = newEdRes.rows[0].id;
         }
 
-        // Проверяем, нет ли книги в библиотеке (по edition_id или по старому work_id)
         const existByEd = await pool.query(
           'SELECT id FROM user_library WHERE user_id = $1 AND edition_id = $2',
           [userId, editionId]
@@ -1200,28 +1260,37 @@ export const bookController = {
 
         const libResult = await pool.query(
           `INSERT INTO user_library (user_id, edition_id, added_via, added_at, format)
-           VALUES ($1, $2, 'manual', CURRENT_TIMESTAMP, $3)
+           VALUES ($1, $2, $3, CURRENT_TIMESTAMP, $4)
            ON CONFLICT DO NOTHING RETURNING id`,
-          [userId, editionId, bookFormat]
+          [userId, editionId, bookAddedVia, bookFormat]
         );
 
         if (libResult.rows.length > 0) {
+          const libId = libResult.rows[0].id;
           await pool.query(
             `INSERT INTO reading_progress (user_id, edition_id, status, created_at)
              VALUES ($1, $2, 'want_to_read', CURRENT_TIMESTAMP)
              ON CONFLICT DO NOTHING`,
             [userId, editionId]
           );
+          if (description || genre) {
+            await pool.query(
+              `UPDATE user_library
+               SET custom_description = COALESCE($1, custom_description),
+                   custom_genre       = COALESCE($2, custom_genre)
+               WHERE id = $3`,
+              [description?.trim() || null, genre?.trim() || null, libId]
+            );
+          }
           return res.status(201).json({
             success: true,
             message: 'Книга добавлена в библиотеку',
-            libraryId: libResult.rows[0].id,
+            libraryId: libId,
             alreadyExists: false
           });
         }
       }
 
-      // ── Путь 2: с ISBN → создаём издание ────────────────────────────────────
       const cleanIsbn = isbn.replace(/[-\s]/g, '');
 
       const userEditionCheck = await pool.query(
@@ -1234,7 +1303,7 @@ export const bookController = {
       );
 
       if (userEditionCheck.rows.length > 0) {
-        console.log('📚 [Controller] ⚠️ Книга уже есть у пользователя');
+        console.log('[Controller] Книга уже есть у пользователя');
         return res.status(200).json({
           success: true,
           message: 'Книга уже в вашей библиотеке',
@@ -1253,17 +1322,10 @@ export const bookController = {
       let workTitle = title;
 
       if (editionResult.rows.length === 0) {
-        console.log('📚 [Controller] Издание не найдено в БД, создаём...');
+        console.log('[Controller] Издание не найдено в БД, создаём...');
 
-        workId = await findOrCreateWork(title, authorName);
-
-        // Сохраняем описание и жанр в произведение
-        if (description || genre) {
-          await pool.query(
-            'UPDATE works SET description = COALESCE($1, description), genre = COALESCE($2, genre) WHERE id = $3',
-            [description?.trim() || null, genre || null, workId]
-          );
-        }
+        workId = await findOrCreateWork(title, authorName, forceUpdate ? undefined : userId);
+        await upsertWorkAuthors(workId, cleanAuthors);
 
         const newEdition = await pool.query(
           `INSERT INTO editions (work_id, isbn, publisher, publish_year, pages, cover_url, language, series)
@@ -1282,7 +1344,7 @@ export const bookController = {
         );
 
         editionId = newEdition.rows[0].id;
-        console.log('📚 [Controller] Издание добавлено в БД, ID:', editionId);
+        console.log('[Controller] Издание добавлено в БД, ID:', editionId);
       } else {
         editionId = editionResult.rows[0].id;
         const workInfo = await pool.query(
@@ -1291,20 +1353,16 @@ export const bookController = {
         );
         workTitle = workInfo.rows[0]?.title || title;
         workId = workInfo.rows[0]?.id;
-        console.log('📚 [Controller] Издание уже есть в БД, ID:', editionId);
+        console.log('[Controller] Издание уже есть в БД, ID:', editionId);
 
-        // forceUpdate: пользователь подтвердил другие данные — перезаписываем
         if (forceUpdate && workId) {
-          console.log('📚 [Controller] forceUpdate=true — обновляем данные издания и произведения');
+          console.log('[Controller] forceUpdate=true — обновляем данные издания и произведения');
 
-          const authorIdInDb = workInfo.rows[0]?.author_id;
-          if (authorIdInDb) {
-            await pool.query('UPDATE authors SET full_name = $1 WHERE id = $2', [authorName, authorIdInDb]);
-          }
+          await upsertWorkAuthors(workId, cleanAuthors);
 
           await pool.query(
-            'UPDATE works SET title = $1, description = COALESCE($2, description) WHERE id = $3',
-            [title, description?.trim() || null, workId]
+            'UPDATE works SET title = $1 WHERE id = $2',
+            [title, workId]
           );
           workTitle = title;
 
@@ -1327,17 +1385,39 @@ export const bookController = {
               editionId,
             ]
           );
-          console.log('📚 [Controller] ✅ Данные издания обновлены (forceUpdate)');
+          console.log('[Controller] Данные издания обновлены (forceUpdate)');
         }
       }
 
-      const libraryResult = await pool.query(
-        `INSERT INTO user_library (user_id, edition_id, added_via, added_at, format)
-         VALUES ($1, $2, 'manual', CURRENT_TIMESTAMP, $3)
-         ON CONFLICT DO NOTHING
-         RETURNING id`,
-        [userId, editionId, bookFormat]
-      );
+      let libraryResult;
+      if (workId) {
+        const workOnlyEntry = await pool.query(
+          `SELECT id FROM user_library WHERE user_id = $1 AND work_id = $2 AND edition_id IS NULL`,
+          [userId, workId]
+        );
+        if (workOnlyEntry.rows.length > 0) {
+          const oldId = workOnlyEntry.rows[0].id;
+          libraryResult = await pool.query(
+            `UPDATE user_library SET edition_id = $1, work_id = NULL WHERE id = $2 RETURNING id`,
+            [editionId, oldId]
+          );
+          await pool.query(
+            `UPDATE reading_progress SET edition_id = $1, work_id = NULL
+             WHERE user_id = $2 AND work_id = $3 AND edition_id IS NULL`,
+            [editionId, userId, workId]
+          );
+        }
+      }
+
+      if (!libraryResult || libraryResult.rows.length === 0) {
+        libraryResult = await pool.query(
+          `INSERT INTO user_library (user_id, edition_id, added_via, added_at, format)
+           VALUES ($1, $2, $3, CURRENT_TIMESTAMP, $4)
+           ON CONFLICT DO NOTHING
+           RETURNING id`,
+          [userId, editionId, bookAddedVia, bookFormat]
+        );
+      }
 
       if (libraryResult.rows.length > 0) {
         await pool.query(
@@ -1347,16 +1427,28 @@ export const bookController = {
           [userId, editionId]
         );
 
-        console.log('📚 [Controller] ✅ Книга добавлена в библиотеку пользователя');
+        const newLibraryId = libraryResult.rows[0].id;
+
+        if (description || genre) {
+          await pool.query(
+            `UPDATE user_library
+             SET custom_description = COALESCE($1, custom_description),
+                 custom_genre       = COALESCE($2, custom_genre)
+             WHERE id = $3`,
+            [description?.trim() || null, genre?.trim() || null, newLibraryId]
+          );
+        }
+
+        console.log('[Controller] Книга добавлена в библиотеку пользователя');
         res.status(201).json({
           success: true,
           message: 'Книга добавлена в библиотеку',
-          libraryId: libraryResult.rows[0].id,
+          libraryId: newLibraryId,
           editionId: editionId,
           alreadyExists: false
         });
       } else {
-        console.log('📚 [Controller] ⚠️ Книга уже была в библиотеке пользователя');
+        console.log('[Controller] Книга уже была в библиотеке пользователя');
         const existingLib = await pool.query(
           'SELECT id FROM user_library WHERE user_id = $1 AND edition_id = $2',
           [userId, editionId]
@@ -1371,7 +1463,7 @@ export const bookController = {
       }
 
     } catch (error) {
-      console.error('❌ Ошибка добавления книги вручную:', error);
+      console.error('Ошибка добавления книги вручную:', error);
       
       if ((error as any).code === '23505') {
         return res.status(400).json({ 
@@ -1427,7 +1519,7 @@ export const bookController = {
           [userId, 'Избранные', 'Книги, которые вы отметили как избранные']
         );
         collectionId = newCollection.rows[0].id;
-        console.log('[Controller] ✅ Создана коллекция "Избранные"');
+        console.log('[Controller] Создана коллекция "Избранные"');
       } else {
         collectionId = favoritesCollection.rows[0].id;
       }
@@ -1439,13 +1531,13 @@ export const bookController = {
            ON CONFLICT (user_library_id, collection_id) DO NOTHING`,
           [libraryId, collectionId]
         );
-        console.log('[Controller] ✅ Книга добавлена в коллекцию Избранные');
+        console.log('[Controller] Книга добавлена в коллекцию Избранные');
       } else {
         await pool.query(
           'DELETE FROM book_collections WHERE user_library_id = $1 AND collection_id = $2',
           [libraryId, collectionId]
         );
-        console.log('[Controller] ✅ Книга удалена из коллекции Избранные');
+        console.log('[Controller] Книга удалена из коллекции Избранные');
       }
   
       res.json({ 
@@ -1476,15 +1568,52 @@ export const bookController = {
 
       const userId = (req as any).user.id;
 
+      const libEntry = await pool.query(
+        `SELECT ul.work_id, COALESCE(e.work_id, ul.work_id) AS resolved_work_id
+         FROM user_library ul
+         LEFT JOIN editions e ON ul.edition_id = e.id
+         WHERE ul.id = $1 AND ul.user_id = $2`,
+        [libraryId, userId]
+      );
+
+      if (libEntry.rows.length === 0) {
+        return res.status(404).json({ error: 'Книга не найдена в библиотеке' });
+      }
+
+      const resolvedWorkId: number | null = libEntry.rows[0].resolved_work_id;
+
       const result = await pool.query(
         'DELETE FROM user_library WHERE id = $1 AND user_id = $2 RETURNING id',
         [libraryId, userId]
       );
-  
+
       if (result.rows.length === 0) {
         return res.status(404).json({ error: 'Книга не найдена в библиотеке' });
       }
-  
+
+      if (resolvedWorkId) {
+        const workMeta = await pool.query(
+          'SELECT created_by_user_id FROM works WHERE id = $1',
+          [resolvedWorkId]
+        );
+        const isPersonal = workMeta.rows[0]?.created_by_user_id === userId;
+
+        if (isPersonal) {
+          const otherUsers = await pool.query(
+            `SELECT COUNT(*) FROM user_library
+             WHERE COALESCE(work_id, (SELECT work_id FROM editions WHERE id = edition_id)) = $1`,
+            [resolvedWorkId]
+          );
+          if (parseInt(otherUsers.rows[0].count) === 0) {
+            await pool.query(
+              'DELETE FROM editions WHERE work_id = $1 AND isbn IS NULL',
+              [resolvedWorkId]
+            );
+            await pool.query('DELETE FROM works WHERE id = $1', [resolvedWorkId]);
+          }
+        }
+      }
+
       res.json({ success: true, message: 'Книга удалена из библиотеки' });
     } catch (error) {
       console.error('Ошибка удаления книги:', error);
@@ -1558,7 +1687,7 @@ export const bookController = {
       res.json(result.rows);
   
     } catch (error) {
-      console.error('❌ Ошибка получения маршрутов:', error);
+      console.error('Ошибка получения маршрутов:', error);
       res.status(500).json({ error: 'Ошибка сервера при получении маршрутов' });
     }
   },
@@ -1594,7 +1723,7 @@ export const bookController = {
           ul.id                                           AS book_id,
           w.id                                            AS work_id,
           w.title,
-          a.full_name                                     AS author,
+          COALESCE((SELECT STRING_AGG(a2.full_name, ', ' ORDER BY wa.sort_order) FROM work_authors wa JOIN authors a2 ON a2.id = wa.author_id WHERE wa.work_id = w.id), a.full_name) AS author,
           e.cover_url,
           rb.order_index,
           COALESCE(rp.status, 'want_to_read')             AS status,
@@ -1644,7 +1773,7 @@ export const bookController = {
       });
   
     } catch (error) {
-      console.error('❌ Ошибка получения маршрута:', error);
+      console.error('Ошибка получения маршрута:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -1676,7 +1805,6 @@ export const bookController = {
       if (books && books.length > 0) {
         for (let i = 0; i < books.length; i++) {
           const book = books[i];
-          // book.bookId — это user_library.id (library_id), ищем work_id через библиотеку
           const workResult = await pool.query(
             `SELECT COALESCE(e.work_id, ul.work_id) AS work_id
              FROM user_library ul
@@ -1716,7 +1844,7 @@ export const bookController = {
   
     } catch (error) {
       await pool.query('ROLLBACK');
-      console.error('❌ Ошибка создания маршрута:', error);
+      console.error('Ошибка создания маршрута:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -1731,7 +1859,6 @@ export const bookController = {
       
       const routeId = parseInt(routeIdParam);
       const userId = (req as any).user.id;
-      // Измените: ожидаем books вместо works
       const { name, description, planned_start_date, planned_end_date, status, books } = req.body;
   
       const checkRes = await pool.query(
@@ -1764,14 +1891,13 @@ export const bookController = {
       );
   
       if (books !== undefined) {
-        // Удаляем старые связи
         await pool.query('DELETE FROM route_books WHERE route_id = $1', [routeId]);
   
-        // Добавляем новые
         for (let i = 0; i < books.length; i++) {
           const book = books[i];
-          // book.bookId — это user_library.id, ищем work_id через библиотеку
-          const workResult = await pool.query(
+          let workId: number | null = null;
+
+          const libResult = await pool.query(
             `SELECT COALESCE(e.work_id, ul.work_id) AS work_id
              FROM user_library ul
              LEFT JOIN editions e ON ul.edition_id = e.id
@@ -1779,26 +1905,32 @@ export const bookController = {
             [book.bookId, userId]
           );
 
-          if (workResult.rows.length > 0 && workResult.rows[0].work_id) {
+          if (libResult.rows.length > 0 && libResult.rows[0].work_id) {
+            workId = libResult.rows[0].work_id;
+          } else {
+            const directWork = await pool.query('SELECT id FROM works WHERE id = $1', [book.bookId]);
+            if (directWork.rows.length > 0) workId = book.bookId;
+          }
+
+          if (workId) {
             await pool.query(
               `INSERT INTO route_books (route_id, work_id, order_index)
                VALUES ($1, $2, $3)`,
-              [routeId, workResult.rows[0].work_id, book.order_index !== undefined ? book.order_index : i]
+              [routeId, workId, book.order_index !== undefined ? book.order_index : i]
             );
           }
         }
       }
   
       await pool.query('COMMIT');
-  
-      // Получаем обновленный список книг
+
       const booksResult = await pool.query(
         `SELECT 
           rb.id,
           e.id as book_id,
           w.id as work_id,
           w.title,
-          a.full_name as author,
+          COALESCE((SELECT STRING_AGG(a2.full_name, ', ' ORDER BY wa.sort_order) FROM work_authors wa JOIN authors a2 ON a2.id = wa.author_id WHERE wa.work_id = w.id), a.full_name) as author,
           e.cover_url,
           rb.order_index,
           COALESCE(rp.status, 'want_to_read') as status,
@@ -1821,7 +1953,7 @@ export const bookController = {
   
     } catch (error) {
       await pool.query('ROLLBACK');
-      console.error('❌ Ошибка обновления маршрута:', error);
+      console.error('Ошибка обновления маршрута:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -1877,10 +2009,37 @@ export const bookController = {
         return res.status(400).json({ error: 'Маршрут не найден или уже активен' });
       }
 
+      const routeBooks = await pool.query(
+        `SELECT rb.work_id FROM route_books rb WHERE rb.route_id = $1`,
+        [routeId]
+      );
+      for (const rb of routeBooks.rows) {
+        const edRes = await pool.query(
+          `SELECT id FROM editions WHERE work_id = $1 ORDER BY id LIMIT 1`,
+          [rb.work_id]
+        );
+        if (edRes.rows.length === 0) continue;
+        const editionId = edRes.rows[0].id;
+        const libRes = await pool.query(
+          `INSERT INTO user_library (user_id, edition_id, added_via, added_at)
+           VALUES ($1, $2, 'ai_route', CURRENT_TIMESTAMP)
+           ON CONFLICT DO NOTHING RETURNING id`,
+          [userId, editionId]
+        );
+        if (libRes.rows.length > 0) {
+          await pool.query(
+            `INSERT INTO reading_progress (user_id, edition_id, status, created_at)
+             VALUES ($1, $2, 'want_to_read', CURRENT_TIMESTAMP)
+             ON CONFLICT DO NOTHING`,
+            [userId, editionId]
+          );
+        }
+      }
+
       res.json({ success: true, message: 'Маршрут активирован' });
 
     } catch (error) {
-      console.error('❌ Ошибка активации маршрута:', error);
+      console.error('Ошибка активации маршрута:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -1911,7 +2070,7 @@ export const bookController = {
       res.json({ success: true, message: 'Маршрут завершен! Поздравляем!' });
 
     } catch (error) {
-      console.error('❌ Ошибка завершения маршрута:', error);
+      console.error('Ошибка завершения маршрута:', error);
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
@@ -1961,10 +2120,6 @@ export const bookController = {
       res.status(500).json({ error: 'Ошибка сервера' });
     }
   },
-    /**
-   * Найти или создать произведение (Work) по названию и автору
-   * POST /books/works/find-or-create
-   */
     async findOrCreateWork(req: Request, res: Response) {
       try {
         const { title, author } = req.body;
@@ -1973,10 +2128,9 @@ export const bookController = {
           return res.status(400).json({ error: 'Название и автор обязательны' });
         }
   
-        // Вызываем существующую внутреннюю функцию
-        // (она должна быть доступна в области видимости контроллера)
-        const workId = await findOrCreateWork(title, author);
-        
+        const userId = (req as any).user?.id;
+        const workId = await findOrCreateWork(title, author, userId);
+
         res.json({ success: true, workId, message: 'Произведение найдено или создано' });
         
       } catch (error) {
@@ -2101,9 +2255,9 @@ export const bookController = {
       const userId = (req as any).user.id;
       const libraryId = parseInt(req.params.libraryId as string);
       if (isNaN(libraryId)) return res.status(400).json({ error: 'Неверный ID записи библиотеки' });
-      const { title, authors, pages, publisher, publish_year, cover_url, language, series, description, format } = req.body as {
+      const { title, authors, pages, publisher, publish_year, cover_url, language, series, description, genre, format, isbn } = req.body as {
         title?: string; authors?: string[]; pages?: any; publisher?: string;
-        publish_year?: any; cover_url?: string; language?: string; series?: string; description?: string; format?: string;
+        publish_year?: any; cover_url?: string; language?: string; series?: string; description?: string; genre?: string; format?: string; isbn?: string;
       };
       if (format !== undefined && !['physical', 'digital', 'audio'].includes(format)) {
         return res.status(400).json({ error: 'Недопустимый формат книги' });
@@ -2126,58 +2280,83 @@ export const bookController = {
 
       await pool.query('BEGIN');
 
-      // Обновляем автора
-      if (Array.isArray(authors) && authors.length > 0 && author_id) {
-        const authorName = authors.filter((a: string) => a?.trim()).join(', ') || 'Неизвестный автор';
-        await pool.query('UPDATE authors SET full_name = $1 WHERE id = $2', [authorName, author_id]);
+      if (Array.isArray(authors) && authors.length > 0 && work_id) {
+        await upsertWorkAuthors(work_id, authors.filter((a: string) => a?.trim()));
       }
 
-      // Обновляем название и описание произведения
-      if (work_id) {
-        if (title?.trim()) {
-          await pool.query('UPDATE works SET title = $1 WHERE id = $2', [title.trim(), work_id]);
-        }
+      if (work_id && title?.trim()) {
+        await pool.query('UPDATE works SET title = $1 WHERE id = $2', [title.trim(), work_id]);
+      }
+
+      {
+        const ulUpdates: string[] = [];
+        const ulParams: any[] = [];
+        let idx = 1;
         if (description !== undefined) {
+          ulUpdates.push(`custom_description = $${idx++}`);
+          ulParams.push(description?.trim() || null);
+        }
+        if (genre !== undefined) {
+          ulUpdates.push(`custom_genre = $${idx++}`);
+          ulParams.push(genre?.trim() || null);
+        }
+        if (ulUpdates.length > 0) {
+          ulParams.push(libraryId, userId);
           await pool.query(
-            'UPDATE works SET description = $1 WHERE id = $2',
-            [description?.trim() || null, work_id]
+            `UPDATE user_library SET ${ulUpdates.join(', ')} WHERE id = $${idx++} AND user_id = $${idx}`,
+            ulParams
           );
         }
       }
 
-      // Обновляем издание
       if (edition_id) {
         const setClauses: string[] = [];
         const params: any[] = [];
         let idx = 1;
 
-        setClauses.push(`pages = $${idx++}`);
-        params.push(pages ? parseInt(String(pages)) : null);
+        if (pages !== undefined) {
+          setClauses.push(`pages = $${idx++}`);
+          params.push(pages ? parseInt(String(pages)) : null);
+        }
 
-        setClauses.push(`publisher = $${idx++}`);
-        params.push(publisher?.trim() || null);
+        if (publisher !== undefined) {
+          setClauses.push(`publisher = $${idx++}`);
+          params.push(publisher?.trim() || null);
+        }
 
-        setClauses.push(`publish_year = $${idx++}`);
-        params.push(publish_year ? parseInt(String(publish_year)) : null);
+        if (publish_year !== undefined) {
+          setClauses.push(`publish_year = $${idx++}`);
+          params.push(publish_year ? parseInt(String(publish_year)) : null);
+        }
 
         if (cover_url !== undefined) {
           setClauses.push(`cover_url = $${idx++}`);
           params.push(cover_url?.trim() || null);
         }
 
-        setClauses.push(`language = $${idx++}`);
-        params.push(language?.trim() || 'ru');
+        if (language !== undefined) {
+          setClauses.push(`language = $${idx++}`);
+          params.push(language?.trim() || 'ru');
+        }
 
-        setClauses.push(`series = $${idx++}`);
-        params.push(series?.trim() || null);
+        if (series !== undefined) {
+          setClauses.push(`series = $${idx++}`);
+          params.push(series?.trim() || null);
+        }
 
-        params.push(edition_id);
-        await pool.query(
-          `UPDATE editions SET ${setClauses.join(', ')} WHERE id = $${idx}`,
-          params
-        );
+        if (isbn !== undefined) {
+          setClauses.push(`isbn = $${idx++}`);
+          params.push(isbn?.trim() || null);
+        }
 
-        // Сбрасываем custom_cover_url если обложка была обновлена
+        if (setClauses.length > 0) {
+          params.push(edition_id);
+          await pool.query(
+            `UPDATE editions SET ${setClauses.join(', ')} WHERE id = $${idx}`,
+            params
+          );
+        }
+
         if (cover_url !== undefined) {
           await pool.query(
             'UPDATE user_library SET custom_cover_url = NULL WHERE id = $1 AND user_id = $2',
@@ -2186,7 +2365,6 @@ export const bookController = {
         }
       }
 
-      // Обновляем format в user_library
       if (format !== undefined) {
         await pool.query(
           'UPDATE user_library SET format = $1 WHERE id = $2 AND user_id = $3',
@@ -2234,7 +2412,7 @@ export const bookController = {
       const base64Image = imageBuffer.toString('base64');
       if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
-      console.log('📷 [CoverScan] Отправляем в Yandex Vision OCR...');
+      console.log('[CoverScan] Отправляем в Yandex Vision OCR...');
       const ocrResponse = await axios.post(
         'https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText',
         {
@@ -2254,19 +2432,18 @@ export const bookController = {
       );
 
       const fullText: string = ocrResponse.data?.result?.textAnnotation?.fullText || '';
-      console.log('📷 [CoverScan] OCR результат:', fullText.slice(0, 150));
+      console.log('[CoverScan] OCR результат:', fullText.slice(0, 150));
 
       if (!fullText.trim()) {
         return res.json({ found: false, recognizedText: '', message: 'Текст не распознан' });
       }
 
-      // YandexGPT извлекает название и автора из сырого OCR-текста
       let query = fullText.replace(/\n/g, ' ').trim().slice(0, 120);
       let gptTitle: string | null = null;
       let gptAuthor: string | null = null;
       let gptSeries: string | null = null;
       try {
-        console.log('📷 [CoverScan] Отправляем в YandexGPT для извлечения названия...');
+        console.log('[CoverScan] Отправляем в YandexGPT для извлечения названия...');
         const gptRes = await axios.post(
           'https://llm.api.cloud.yandex.net/foundationModels/v1/completion',
           {
@@ -2301,15 +2478,15 @@ export const bookController = {
           gptAuthor = parsed.author || null;
           gptSeries = parsed.series || null;
           query = [parsed.title, parsed.author].filter(Boolean).join(' ');
-          console.log('📷 [CoverScan] YandexGPT извлёк:', query, '| Серия:', gptSeries);
+          console.log('[CoverScan] YandexGPT извлёк:', query, '| Серия:', gptSeries);
         }
       } catch (gptErr: any) {
-        console.warn('📷 [CoverScan] YandexGPT не сработал, используем fallback:', gptErr.message);
+        console.warn('[CoverScan] YandexGPT не сработал, используем fallback:', gptErr.message);
         const lines = fullText.split('\n').map(l => l.trim()).filter(l => l.length > 2 && /[а-яёА-ЯЁa-zA-Z]{2,}/.test(l));
         query = lines.slice(0, 3).join(' ').trim().slice(0, 120);
       }
 
-      console.log('📷 [CoverScan] Поисковый запрос:', query);
+      console.log('[CoverScan] Поисковый запрос:', query);
 
       let bookData: any = null;
 
@@ -2347,7 +2524,7 @@ export const bookController = {
           `https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=3&fields=title,author_name,isbn,cover_i,number_of_pages_median,publisher,first_publish_year`,
           { timeout: 15000 },
         );
-        console.log('📷 [CoverScan] Open Library нашёл:', olRes.data?.numFound);
+        console.log('[CoverScan] Open Library нашёл:', olRes.data?.numFound);
         if (olRes.data?.numFound > 0 && olRes.data.docs?.length > 0) {
           const doc = olRes.data.docs[0];
           return {
@@ -2364,38 +2541,35 @@ export const bookController = {
         return null;
       };
 
-      // Строим несколько вариантов запроса: полный → только название → только автор
       const titleOnly = gptTitle || query.split(' ').slice(0, 3).join(' ');
       const queries = [query, titleOnly].filter((q, i, arr) => arr.indexOf(q) === i && q.trim());
 
-      // 1. Google Books: пробуем каждый вариант запроса, при 429 сразу переходим к Open Library
       let google429 = false;
       for (const q of queries) {
         if (bookData || google429) break;
         try {
           bookData = await searchGoogleBooks(q, 'ru');
           if (!bookData) bookData = await searchGoogleBooks(q);
-          if (bookData) console.log('📷 [CoverScan] ✅ Google Books:', bookData.title);
+          if (bookData) console.log('[CoverScan] Google Books:', bookData.title);
         } catch (gbErr: any) {
           if (gbErr.response?.status === 429) {
             google429 = true;
-            console.warn('📷 [CoverScan] Google Books 429 — переходим к Open Library');
+            console.warn('[CoverScan] Google Books 429 — переходим к Open Library');
           } else {
-            console.warn('📷 [CoverScan] Google Books ошибка:', gbErr.message);
+            console.warn('[CoverScan] Google Books ошибка:', gbErr.message);
           }
         }
       }
 
-      // 2. Open Library: пробуем каждый вариант запроса
       if (!bookData) {
-        console.log('📷 [CoverScan] Пробуем Open Library...');
+        console.log('[CoverScan] Пробуем Open Library...');
         for (const q of queries) {
           if (bookData) break;
           try {
             bookData = await searchOpenLibrary(q);
-            if (bookData) console.log('📷 [CoverScan] ✅ Open Library:', bookData.title);
+            if (bookData) console.log('[CoverScan] Open Library:', bookData.title);
           } catch (olErr: any) {
-            console.warn('📷 [CoverScan] Open Library ошибка:', olErr.message);
+            console.warn('[CoverScan] Open Library ошибка:', olErr.message);
           }
         }
       }
@@ -2411,24 +2585,21 @@ export const bookController = {
         });
       }
 
-      // Приоритет: название и автор с русской обложки (от GPT) важнее, чем из внешних API
       if (gptTitle) bookData.title = gptTitle;
       if (gptAuthor) bookData.authors = [gptAuthor];
       if (gptSeries) bookData.series = gptSeries;
 
-      console.log('📷 [CoverScan] ✅ Найдено:', bookData.title, '| Серия:', gptSeries);
+      console.log('[CoverScan] Найдено:', bookData.title, '| Серия:', gptSeries);
       return res.json({ found: true, recognizedText: fullText, ...bookData });
 
     } catch (error: any) {
       if (file && fs.existsSync(file.path)) {
         try { fs.unlinkSync(file.path); } catch {}
       }
-      console.error('📷 [CoverScan] Ошибка:', error.response?.data || error.message);
+      console.error('[CoverScan] Ошибка:', error.response?.data || error.message);
       return res.status(500).json({ error: 'Ошибка распознавания обложки' });
     }
   },
-
-  // ── Рекомендации ──────────────────────────────────────────────────────────
 
   async getRecommendations(req: Request, res: Response) {
     try {

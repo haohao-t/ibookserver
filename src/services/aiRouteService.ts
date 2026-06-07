@@ -1,5 +1,3 @@
-// book_server/src/services/aiRouteService.ts
-
 import pool from '../config/database';
 
 export interface AIBookSuggestion {
@@ -14,6 +12,12 @@ export interface AIRouteResponse {
   books: AIBookSuggestion[];
 }
 
+export type RouteErrorCode = 'not_related' | 'no_books' | 'ai_error';
+
+export type RouteGenerationResult =
+  | { ok: true; route: AIRouteResponse }
+  | { ok: false; errorCode: RouteErrorCode };
+
 class YandexGptService {
   private folderId: string;
   private apiKey: string;
@@ -24,42 +28,76 @@ class YandexGptService {
     this.apiKey = process.env.YANDEX_API_KEY || '';
 
     if (!this.folderId || !this.apiKey) {
-      console.warn('⚠️ YandexGPT: не заданы YANDEX_FOLDER_ID или YANDEX_API_KEY');
+      console.warn('YandexGPT: не заданы YANDEX_FOLDER_ID или YANDEX_API_KEY');
     }
   }
 
-  async generateReadingRoute(userQuery: string): Promise<AIRouteResponse | null> {
-    console.log('\n🤖 [YandexGPT] ========== ГЕНЕРАЦИЯ МАРШРУТА ==========');
-    console.log('🤖 [YandexGPT] Запрос:', userQuery);
+  async generateReadingRoute(userQuery: string, userContext?: {
+    readBooks: string[];
+    favoriteGenres: string[];
+    favoriteAuthors: string[];
+    userAge?: number | null;
+  }): Promise<RouteGenerationResult> {
+    console.log('\n[YandexGPT] ========== ГЕНЕРАЦИЯ МАРШРУТА ==========');
+    console.log('[YandexGPT] Запрос:', userQuery);
+
+    const ageNote = userContext?.userAge
+      ? `\n- Возраст читателя: ${userContext.userAge} лет — подбирай книги, подходящие по возрасту и уровню восприятия`
+      : '';
+
+    const librarySection = userContext && (userContext.readBooks.length > 0 || userContext.userAge)
+      ? `\n\nКонтекст читателя:${ageNote}
+- Уже прочитано (НЕ включать в маршрут): ${userContext.readBooks.slice(0, 15).join(', ') || 'нет данных'}
+- Любимые жанры: ${userContext.favoriteGenres.join(', ') || 'не указаны'}
+- Любимые авторы: ${userContext.favoriteAuthors.join(', ') || 'не указаны'}
+
+Учитывай вкусы и возраст читателя при формировании маршрута. НЕ добавляй книги из списка "уже прочитано".`
+      : '';
 
     try {
       const requestBody = {
         modelUri: `gpt://${this.folderId}/yandexgpt-lite`,
         completionOptions: {
           stream: false,
-          temperature: 0.7,
+          temperature: 0.6,
           maxTokens: 2000
         },
         messages: [
           {
             role: 'system',
-            text: `Ты — эксперт по литературе. Твоя задача — создавать персонализированные читательские маршруты.
+            text: `Ты — эксперт по литературе. Создавай персонализированные читательские маршруты.
+ВАЖНО: Всегда отвечай ТОЛЬКО на русском языке, даже если запрос на другом языке.
+Ответь ТОЛЬКО в формате JSON, без лишних слов и пояснений.
 
-Ты должен ответить ТОЛЬКО в формате JSON, без лишних слов и пояснений.
+СНАЧАЛА проверь, связан ли запрос с книгами, чтением, литературой, изучением любой темы или навыка через книги.
 
-Формат ответа:
+Если запрос НЕ связан с книгами (например: рецепты, спорт, технические задачи без учёбы, бытовые вопросы) — ответь ТОЛЬКО:
+{"error":"not_related"}
+
+Если запрос связан с книгами, но реально существующих подходящих книг крайне мало или их нет — ответь ТОЛЬКО:
+{"error":"no_books"}
+
+Иначе ответь в формате:
 {
-  "name": "Название маршрута (короткое, 3-7 слов)",
-  "description": "Описание маршрута (2-3 предложения)",
+  "name": "Название маршрута (3-6 слов, на русском)",
+  "description": "Описание маршрута (2-3 предложения, на русском)",
   "books": [
-    { "title": "Название книги", "author": "Автор", "reason": "Почему эта книга здесь" }
+    { "title": "Название книги (оригинал или перевод)", "author": "Автор", "reason": "1 предложение на русском — почему эта книга в маршруте" }
   ]
 }
 
-Требования:
-- Маршрут должен содержать от 3 до 7 книг
-- Книги должны идти от простых к сложным
-- Названия книг и авторы — реальные`
+Требования к маршруту:
+- Ровно 5 книг
+- Книги реально существующие и широко известные
+- Порядок: от простых к сложным
+- reason: конкретный (связь с темой запроса), не «культовый роман»
+- Все поля name, description, reason — строго на русском языке
+
+Если пользователь хочет изучить язык (например, английский, испанский и т.д.):
+- Включай учебники и методические пособия по изучению этого языка (Мёрфи, Эккерсли, Голицынский и т.п.)
+- Включай произведения на изучаемом языке с адаптацией для начинающих (graded readers)
+- Если запрос на русском — значит пользователь русскоязычный, книги должны помочь изучить нужный язык с нуля
+- Не предлагай только художественные произведения на этом языке${librarySection}`
           },
           {
             role: 'user',
@@ -80,42 +118,78 @@ class YandexGptService {
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.error('❌ [YandexGPT] Ошибка API:', response.status, errorText);
-        return null;
+        console.error('[YandexGPT] Ошибка API:', response.status, errorText);
+        return { ok: false, errorCode: 'ai_error' };
       }
 
       const data = await response.json();
-      console.log('✅ [YandexGPT] Ответ получен');
+      console.log('[YandexGPT] Ответ получен');
 
-      const assistantMessage = data.result?.alternatives?.[0]?.message?.text;
+      const assistantMessage: string = data.result?.alternatives?.[0]?.message?.text ?? '';
 
       if (!assistantMessage) {
-        console.error('❌ [YandexGPT] Пустой ответ от модели');
-        return null;
+        console.error('[YandexGPT] Пустой ответ от модели');
+        return { ok: false, errorCode: 'ai_error' };
       }
 
-      let jsonString = assistantMessage;
-      const jsonMatch = assistantMessage.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        jsonString = jsonMatch[0];
+      console.log('[YandexGPT] Raw response (first 300):', assistantMessage.substring(0, 300));
+
+      let jsonString: string | null = null;
+
+      const mdMatch = assistantMessage.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+      if (mdMatch) {
+        jsonString = mdMatch[1] ?? null;
       }
 
-      const parsed = JSON.parse(jsonString);
-      return parsed as AIRouteResponse;
+      if (!jsonString) {
+        const start = assistantMessage.indexOf('{');
+        const end = assistantMessage.lastIndexOf('}');
+        if (start !== -1 && end > start) {
+          jsonString = assistantMessage.substring(start, end + 1);
+        }
+      }
+
+      if (!jsonString) {
+        console.error('[YandexGPT] JSON не найден в ответе');
+        return { ok: false, errorCode: 'ai_error' };
+      }
+
+      try {
+        const parsed = JSON.parse(jsonString);
+
+        if (parsed.error === 'not_related') {
+          console.log('[YandexGPT] Запрос не связан с книгами');
+          return { ok: false, errorCode: 'not_related' };
+        }
+        if (parsed.error === 'no_books') {
+          console.log('[YandexGPT] Не удалось подобрать книги');
+          return { ok: false, errorCode: 'no_books' };
+        }
+
+        if (!parsed.books || !Array.isArray(parsed.books) || parsed.books.length === 0) {
+          console.error('[YandexGPT] Нет книг в ответе');
+          return { ok: false, errorCode: 'no_books' };
+        }
+        return { ok: true, route: parsed as AIRouteResponse };
+      } catch (parseErr) {
+        console.error('[YandexGPT] Ошибка парсинга JSON:', (parseErr as Error).message);
+        console.error('[YandexGPT] Строка:', jsonString.substring(0, 300));
+        return { ok: false, errorCode: 'ai_error' };
+      }
 
     } catch (error) {
-      console.error('❌ [YandexGPT] Ошибка:', error);
-      return null;
+      console.error('[YandexGPT] Ошибка:', error);
+      return { ok: false, errorCode: 'ai_error' };
     }
   }
  
   async findOrCreateWork(title: string, author: string): Promise<number | null> {
-    console.log(`📚 [AI] Поиск/создание произведения: ${title} - ${author}`);
+    console.log(`[AI] Поиск/создание произведения: ${title} - ${author}`);
     
     try { 
       let authorId = await this.findOrCreateAuthor(author);
       if (!authorId) {
-        console.error(`❌ [AI] Не удалось создать автора: ${author}`);
+        console.error(`[AI] Не удалось создать автора: ${author}`);
         return null;
       }
  
@@ -126,11 +200,11 @@ class YandexGptService {
       );
 
       if (workResult.rows.length > 0) {
-        console.log(`✅ [AI] Произведение найдено, work_id: ${workResult.rows[0].id}`);
+        console.log(`[AI] Произведение найдено, work_id: ${workResult.rows[0].id}`);
         return workResult.rows[0].id;
       }
  
-      console.log(`🔍 [AI] Произведения нет в БД, ищем реальные данные...`);
+      console.log(`[AI] Произведения нет в БД, ищем реальные данные...`);
       const bookData = await this.findBookData(title, author);
        
       const description = bookData?.description || null;
@@ -144,7 +218,7 @@ class YandexGptService {
       );
       
       const workId = newWork.rows[0].id;
-      console.log(`✅ [AI] Создано новое произведение, work_id: ${workId}`);
+      console.log(`[AI] Создано новое произведение, work_id: ${workId}`);
  
       if (bookData && (bookData.isbn || bookData.publisher || bookData.pages)) {
         await this.createEdition(workId, bookData);
@@ -153,7 +227,7 @@ class YandexGptService {
       return workId;
 
     } catch (error) {
-      console.error('❌ [AI] Ошибка поиска/создания произведения:', error);
+      console.error('[AI] Ошибка поиска/создания произведения:', error);
       return null;
     }
   }
@@ -174,11 +248,11 @@ class YandexGptService {
         [authorName.trim()]
       );
       
-      console.log(`✅ [AI] Создан новый автор: ${authorName}, ID: ${newAuthor.rows[0].id}`);
+      console.log(`[AI] Создан новый автор: ${authorName}, ID: ${newAuthor.rows[0].id}`);
       return newAuthor.rows[0].id;
 
     } catch (error) {
-      console.error('❌ [AI] Ошибка при работе с автором:', error);
+      console.error('[AI] Ошибка при работе с автором:', error);
       return null;
     }
   }
@@ -193,7 +267,7 @@ class YandexGptService {
     description?: string;
     genre?: string;
   } | null> {
-    console.log(`🔍 [AI] Поиск данных книги в Google Books: ${title} - ${author}`);
+    console.log(`[AI] Поиск данных книги в Google Books: ${title} - ${author}`);
     
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
@@ -208,7 +282,7 @@ class YandexGptService {
       const data = await response.json();
       
       if (!data.items || data.items.length === 0) {
-        console.log(`❌ [AI] Книга не найдена в Google Books`);
+        console.log(`[AI] Книга не найдена в Google Books`);
         return null;
       }
       
@@ -252,12 +326,12 @@ class YandexGptService {
        
       if (!bookData.language) bookData.language = 'ru';
       
-      console.log(`✅ [AI] Найдены данные: ISBN=${bookData.isbn || '?'}, страниц=${bookData.pages || '?'}, жанр=${bookData.genre || '?'}`);
+      console.log(`[AI] Найдены данные: ISBN=${bookData.isbn || '?'}, страниц=${bookData.pages || '?'}, жанр=${bookData.genre || '?'}`);
       return bookData;
       
     } catch (error) {
       clearTimeout(timeout);
-      console.warn(`⚠️ [AI] Ошибка поиска данных для "${title}":`, error);
+      console.warn(`[AI] Ошибка поиска данных для "${title}":`, error);
       return null;
     }
   }
@@ -289,7 +363,7 @@ class YandexGptService {
       );
       
       if (editionResult.rows.length > 0) {
-        console.log(`✅ [AI] Создано издание, edition_id: ${editionResult.rows[0].id}`);
+        console.log(`[AI] Создано издание, edition_id: ${editionResult.rows[0].id}`);
         return editionResult.rows[0].id;
       }
       
@@ -299,14 +373,14 @@ class YandexGptService {
           [isbn]
         );
         if (existing.rows.length > 0) {
-          console.log(`✅ [AI] Издание уже существует, edition_id: ${existing.rows[0].id}`);
+          console.log(`[AI] Издание уже существует, edition_id: ${existing.rows[0].id}`);
           return existing.rows[0].id;
         }
       }
       
       return null;
     } catch (error) {
-      console.error('❌ [AI] Ошибка создания издания:', error);
+      console.error('[AI] Ошибка создания издания:', error);
       return null;
     }
   }
@@ -319,7 +393,7 @@ class YandexGptService {
       );
       
       if (existingEdition.rows.length > 0) {
-        console.log(`✅ [AI] Найдено существующее издание, edition_id: ${existingEdition.rows[0].id}`);
+        console.log(`[AI] Найдено существующее издание, edition_id: ${existingEdition.rows[0].id}`);
         return existingEdition.rows[0].id;
       }
       
@@ -330,11 +404,11 @@ class YandexGptService {
         [workId]
       );
       
-      console.log(`✅ [AI] Создано базовое издание, edition_id: ${newEdition.rows[0].id}`);
+      console.log(`[AI] Создано базовое издание, edition_id: ${newEdition.rows[0].id}`);
       return newEdition.rows[0].id;
       
     } catch (error) {
-      console.error('❌ [AI] Ошибка при получении/создании издания:', error);
+      console.error('[AI] Ошибка при получении/создании издания:', error);
       return null;
     }
   }
