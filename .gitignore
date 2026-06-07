@@ -1,6 +1,1 @@
-﻿node_modules/
-dist/
 .env
-uploads/
-temp/
-*.js.map
